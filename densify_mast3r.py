@@ -43,6 +43,80 @@ NO_POINT = 18446744073709551615
 DEFAULT_OUTPUT = 'densified.ply'
 DEFAULT_PAIRS = 'pairs.json'
 
+def compute_robust_bounding_box(reconstruction, min_visibility=3, padding_factor=0.1):
+    """
+    Compute a robust bounding box from COLMAP 3D points with good visibility.
+    
+    Args:
+        reconstruction: COLMAP reconstruction object
+        min_visibility: Minimum number of images a point must be visible in
+        padding_factor: Additional padding as fraction of bounding box size
+    
+    Returns:
+        bbox_min, bbox_max: 3D coordinates of bounding box corners
+    """
+    robust_points = []
+    
+    # Collect 3D points with sufficient visibility
+    for point_id, point3D in reconstruction.points3D.items():
+        if len(point3D.track.elements) >= min_visibility:
+            robust_points.append(point3D.xyz)
+    
+    if len(robust_points) == 0:
+        print(f"Warning: No points found with visibility >= {min_visibility}")
+        # Fallback to all points
+        robust_points = [point3D.xyz for point3D in reconstruction.points3D.values()]
+    
+    if len(robust_points) == 0:
+        print("Warning: No 3D points found in reconstruction")
+        return None, None
+    
+    robust_points = np.array(robust_points)
+    
+    # Compute percentile-based bounding box to be robust to outliers
+    bbox_min = np.percentile(robust_points, 5, axis=0)   # 5th percentile
+    bbox_max = np.percentile(robust_points, 95, axis=0)  # 95th percentile
+    
+    # Add padding
+    bbox_size = bbox_max - bbox_min
+    padding = bbox_size * padding_factor
+    bbox_min -= padding
+    bbox_max += padding
+    
+    print(f"Computed robust bounding box from {len(robust_points)} points (min_visibility={min_visibility})")
+    print(f"  Min: [{bbox_min[0]:.3f}, {bbox_min[1]:.3f}, {bbox_min[2]:.3f}]")
+    print(f"  Max: [{bbox_max[0]:.3f}, {bbox_max[1]:.3f}, {bbox_max[2]:.3f}]")
+    print(f"  Size: [{bbox_size[0]:.3f}, {bbox_size[1]:.3f}, {bbox_size[2]:.3f}]")
+    
+    return bbox_min, bbox_max
+
+
+def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
+    """
+    Filter points and colors to only include those within the bounding box.
+    
+    Args:
+        points: Nx3 array of 3D points
+        colors: Nx3 array of RGB colors
+        bbox_min, bbox_max: 3D coordinates of bounding box corners
+    
+    Returns:
+        filtered_points, filtered_colors: Arrays containing only points inside bbox
+    """
+    if bbox_min is None or bbox_max is None:
+        return points, colors
+    
+    # Check which points are inside the bounding box
+    inside_mask = np.all((points >= bbox_min) & (points <= bbox_max), axis=1)
+    
+    filtered_points = points[inside_mask]
+    filtered_colors = colors[inside_mask]
+    
+    print(f"Filtered {len(points)} points to {len(filtered_points)} points inside bounding box")
+    
+    return filtered_points, filtered_colors
+
+
 def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matches_img2, img_dir):
     """
     Compute depth values for matches in the reference frame (img1) from a pair.
@@ -97,12 +171,12 @@ def check_depth_consistency(pixel_depths, threshold=0.05, min_validations=2):
     """
     Find the depth value with maximum number of validations (robust to outliers).
     For each depth, count how many other depths are within threshold% of it.
-    Returns the depth with the most validations and whether it meets min requirements.
+    Returns the average of all depths consistent with the most validated depth.
     
     pixel_depths: list of depth values for the same pixel from different pairings
     threshold: maximum allowed relative depth variation (e.g., 0.05 for 5%)
     min_validations: minimum number of validations required
-    Returns: (best_depth, is_consistent, num_validations)
+    Returns: (avg_consistent_depth, is_consistent, num_validations)
     """
     if len(pixel_depths) < 2:
         if len(pixel_depths) == 1:
@@ -121,7 +195,7 @@ def check_depth_consistency(pixel_depths, threshold=0.05, min_validations=2):
             return None, False, 0
     
     # For each depth, count how many other depths are within threshold% of it
-    best_depth = None
+    best_candidate_depth = None
     max_validations = 0
     
     for i, candidate_depth in enumerate(valid_depths):
@@ -138,10 +212,23 @@ def check_depth_consistency(pixel_depths, threshold=0.05, min_validations=2):
         
         if validations > max_validations:
             max_validations = validations
-            best_depth = candidate_depth
+            best_candidate_depth = candidate_depth
     
-    is_consistent = max_validations >= min_validations
-    return best_depth, is_consistent, max_validations
+    # Now collect all depths that are consistent with the best candidate depth
+    # and return their average for smoother results
+    if best_candidate_depth is not None:
+        consistent_depths = []
+        for depth in valid_depths:
+            relative_error = abs(depth - best_candidate_depth) / best_candidate_depth
+            if relative_error <= threshold:
+                consistent_depths.append(depth)
+        
+        # Return average of all consistent depths
+        avg_consistent_depth = np.mean(consistent_depths)
+        is_consistent = max_validations >= min_validations
+        return avg_consistent_depth, is_consistent, max_validations
+    else:
+        return None, False, 0
 
 
 def densify_with_consistency_check(reconstruction, img_dir, pairs, batch_size=20, sampling_factor=8, 
@@ -270,12 +357,12 @@ def densify_with_consistency_check(reconstruction, img_dir, pairs, batch_size=20
         
         for pixel_coord, depths in pixel_depth_maps.items():
             if len(depths) >= min_consistent_pairs:
-                best_depth, is_consistent, num_validations = check_depth_consistency(
+                avg_depth, is_consistent, num_validations = check_depth_consistency(
                     depths, depth_consistency_threshold, min_consistent_pairs)
                 
-                if is_consistent and best_depth is not None:
-                    # Find the point closest to the best validated depth
-                    best_idx = np.argmin(np.abs(np.array(depths) - best_depth))
+                if is_consistent and avg_depth is not None:
+                    # Find the point closest to the average validated depth
+                    best_idx = np.argmin(np.abs(np.array(depths) - avg_depth))
                     best_point = pixel_points_maps[pixel_coord][best_idx]
                     
                     consistent_points.append(best_point)
@@ -310,6 +397,10 @@ def main():
     parser.add_argument('--min_consistent_pairs', type=int, required=False, help='Minimum number of consistent pairings required to keep a point. Default = 3', default=3)
     parser.add_argument('--depth_consistency_threshold', type=float, required=False, help='Depth consistency threshold as percentage (e.g., 0.05 for 5%%). Default = 0.05', default=0.05)
     parser.add_argument('--enable_consistency_check', action='store_true', help='Enable multi-pairing consistency checking')
+    # New parameters for bounding box filtering
+    parser.add_argument('--enable_bbox_filter', action='store_true', help='Enable bounding box filtering based on COLMAP 3D points')
+    parser.add_argument('--min_point_visibility', type=int, required=False, help='Minimum visibility (number of images) for COLMAP points used in bounding box computation. Default = 3', default=3)
+    parser.add_argument('--bbox_padding_factor', type=float, required=False, help='Additional padding for bounding box as fraction of size. Default = 0.1', default=0.1)
     args = parser.parse_args()
 
     reconstruction_path = args.reconstruction_path
@@ -327,6 +418,10 @@ def main():
     min_consistent_pairs = args.min_consistent_pairs
     depth_consistency_threshold = args.depth_consistency_threshold
     enable_consistency_check = args.enable_consistency_check
+    # Bounding box filtering parameters
+    enable_bbox_filter = args.enable_bbox_filter
+    min_point_visibility = args.min_point_visibility
+    bbox_padding_factor = args.bbox_padding_factor
 
     if use_existing_pairs and not os.path.exists(pairs_path):
         print(f"Pairs file {pairs_path} does not exist. Falling back to generating new pairs.")
@@ -346,6 +441,15 @@ def main():
 
     print(f"Loading reconstruction from {reconstruction_path}...")
     reconstruction = pycolmap.Reconstruction(reconstruction_path)
+    
+    # Compute robust bounding box if filtering is enabled
+    bbox_min, bbox_max = None, None
+    if enable_bbox_filter:
+        bbox_min, bbox_max = compute_robust_bounding_box(
+            reconstruction, 
+            min_visibility=min_point_visibility, 
+            padding_factor=bbox_padding_factor
+        )
     
     if not use_existing_pairs:
         if enable_consistency_check:
@@ -390,12 +494,22 @@ def main():
             all_points = np.concatenate([all_points, frame_data['points']], axis=0)
             all_colors = np.concatenate([all_colors, frame_data['colors']], axis=0)
 
+    # Apply bounding box filtering if enabled
+    if enable_bbox_filter and bbox_min is not None and bbox_max is not None:
+        all_points, all_colors = filter_points_by_bounding_box(all_points, all_colors, bbox_min, bbox_max)
+
+    # Check if we have any points left after filtering
+    if all_points is None or len(all_points) == 0:
+        print("No points remaining after filtering. Exiting.")
+        return
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(all_points)
     pcd.colors = o3d.utility.Vector3dVector(all_colors)
 
     # save all points to a ply file
     o3d.io.write_point_cloud(output_path, pcd)
+    print(f"Saved {len(all_points)} points to {output_path}")
 
     # display the point cloud
     o3d.visualization.draw_geometries([pcd])

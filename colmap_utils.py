@@ -104,9 +104,9 @@ class ColmapReconstruction:
     
    
     def _find_best_partner_for_image(self, image_id: int, min_points: int = 100, 
-                                   parallax_sample_size: int = 100) -> int:
+                                   parallax_sample_size: int = 100) -> List[int]:
         """
-        Internal function to find the single best partner for a given image.
+        Internal function to find the best partners for a given image.
         
         Args:
             image_id: ID of the image to find a partner for
@@ -114,7 +114,7 @@ class ColmapReconstruction:
             parallax_sample_size: Number of points to sample for parallax computation
         
         Returns:
-            best_partner_id: ID of the best matching image, or -1 if no good match found
+            List of partner image IDs that satisfy parallax requirements, or [-1] if no good match found
         """
         # Find other images that share at least min_points points
         other_images = [other_image for other_image in self.reconstruction.images.values() 
@@ -133,7 +133,7 @@ class ColmapReconstruction:
         
         # Skip if no good candidates found
         if len(match_candidates) == 0 or len(match_candidates[0].shared_points) < min_points:
-            return -1
+            return [-1]
         
         # Filter out match candidates that don't have enough matches
         match_candidates = [candidate for candidate in match_candidates 
@@ -155,18 +155,19 @@ class ColmapReconstruction:
                 parallax_sample_size)
 
         if len(match_candidates) == 0:
-            return -1
+            return [-1]
         
-        # Make sure the high overlap match has good parallax
-        winning_index = -1
-        for i in range(len(match_candidates)):
-            if match_candidates[i].avg_parallax_angle > 0.1:
-                winning_index = i
-                break
-        if winning_index == -1:
-            winning_index = 0
+        # Collect all candidates with good parallax
+        good_parallax_candidates = []
+        for candidate in match_candidates:
+            if candidate.avg_parallax_angle > 0.1:
+                good_parallax_candidates.append(candidate.image_id)
         
-        return match_candidates[winning_index].image_id
+        # If no good parallax candidates, return the first candidate as fallback
+        if len(good_parallax_candidates) == 0:
+            good_parallax_candidates = [match_candidates[0].image_id]
+        
+        return good_parallax_candidates
     
     def get_multiple_pairs_per_image(self, max_pairs_per_image: int = 7, min_points: int = 100, 
                                    parallax_sample_size: int = 100, min_feature_coverage: float = 0.6) -> Dict[int, List[int]]:
@@ -249,14 +250,15 @@ class ColmapReconstruction:
         for i, image in enumerate(self.reconstruction.images.values()):
             print(f"Getting best corresponding image for {image.name}... {i}/{len(self.reconstruction.images) - 1}")
             
-            # Find the best partner for this image using the extracted function
-            best_partner_id = self._find_best_partner_for_image(
+            # Find the best partners for this image using the extracted function
+            best_partner_ids = self._find_best_partner_for_image(
                 image_id=image.image_id,
                 min_points=min_points,
                 parallax_sample_size=parallax_sample_size
             )
             
-            pairs[image.image_id] = best_partner_id
+            # Use the first (best) partner to maintain original behavior
+            pairs[image.image_id] = best_partner_ids[0]
 
         return pairs
     

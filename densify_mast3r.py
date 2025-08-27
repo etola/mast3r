@@ -17,7 +17,7 @@ from mast3r.model import AsymmetricMASt3R
 from mast3r.fast_nn import fast_reciprocal_NNs
 
 import mast3r.utils.path_to_dust3r 
-from dust3r.utils.image import load_images
+from image_io import load_images, initialize_cache, print_cache_stats
 from dust3r.inference import inference
 
 import colmap_utils
@@ -327,6 +327,7 @@ def main():
     parser.add_argument('-b', '--batch_size', type=int, required=False, help='Batch size for inference. 1 will always work, but will be slower. 24GB GPU can handle batch size of 30', default=1)
     parser.add_argument('-c', '--force_cpu', action='store_true', help='Force CPU inference instead of CUDA')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('--cache_memory_gb', type=float, default=16.0, help='Maximum memory for image cache in GB (default: 16.0)')
     parser.add_argument('-f', '--sampling_factor', type=int, required=False, help='Sampling factor for point triangulation. Lower = denser. User powers of 2. Default = 8', default=8)
     parser.add_argument('-m', '--min_feature_coverage', type=float, required=False, help='Minimum proportion of image that must be covered by shared points to be considered a good match. Default = 0.6', default=0.6)
     # New parameters for multi-pairing consistency
@@ -349,6 +350,10 @@ def main():
     
     # Print configuration summary
     config.print_summary()
+    
+    # Initialize image cache for efficient loading and resizing
+    cache_memory_gb = getattr(config, 'cache_memory_gb', 16.0)  # Default to 16GB if not specified
+    initialize_cache(max_memory_gb=cache_memory_gb)
     
     # Check if existing pairs file should be used
     if config.use_existing_pairs and not os.path.exists(config.pairs_path):
@@ -397,6 +402,9 @@ def main():
 
     end_time = time.time()
     print(f"Processing completed in {end_time - start_time:.2f} seconds")
+    
+    # Print cache statistics
+    print_cache_stats()
 
     # Combine all points from different frames
     all_points = None

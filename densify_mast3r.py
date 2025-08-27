@@ -49,37 +49,6 @@ def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
     return filtered_points, filtered_colors
 
 
-def optimized_fast_matching(desc1, desc2, subsample_factor, device, block_size):
-    """
-    Wrapper around fast_reciprocal_NNs with simple optimizations.
-    Focus on practical speed improvements without replacing the core algorithm.
-    """
-    # Use the existing highly optimized fast_reciprocal_NNs
-    # Just add some simple optimizations like better block sizes
-    
-    # Determine optimal block size based on GPU memory and descriptor size
-    H1, W1, D = desc1.shape
-    H2, W2, _ = desc2.shape
-    
-    # Adaptive block size based on descriptor dimensions and GPU memory
-    if device == 'cuda' or (isinstance(device, torch.device) and device.type == 'cuda'):
-        # Larger block size for better GPU utilization
-        optimal_block_size = min(block_size, 2**14)  # Increase from 2**13 to 2**14
-    else:
-        optimal_block_size = block_size
-    
-    # Use the optimized fast_reciprocal_NNs with better parameters
-    from mast3r.fast_nn import fast_reciprocal_NNs
-    
-    matches_img1, matches_img2 = fast_reciprocal_NNs(
-        desc1, desc2, 
-        subsample_or_initxy1=subsample_factor, 
-        device=device, 
-        dist='dot', 
-        block_size=optimal_block_size
-    )
-    
-    return matches_img1, matches_img2
 
 
 def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matches_img2, img_dir):
@@ -232,16 +201,14 @@ def densify_with_consistency_check(reconstruction, pairs, config: DensificationC
                 
                 desc1, desc2 = pred1['desc'][0].squeeze(0).detach(), pred2['desc'][0].squeeze(0).detach()
                 
-                # Use optimized matching
-                if config.enable_fast_matching:
-                    matches_img1, matches_img2 = optimized_fast_matching(
-                        desc1, desc2, 
-                        subsample_factor=config.sampling_factor, 
-                        device=device,
-                        block_size=config.get_block_size()
-                    )
-                else:
-                    matches_img1, matches_img2 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=config.sampling_factor, device=device, dist='dot', block_size=2**13)
+                # Compute feature matches
+                matches_img1, matches_img2 = fast_reciprocal_NNs(
+                    desc1, desc2, 
+                    subsample_or_initxy1=config.sampling_factor, 
+                    device=device, 
+                    dist='dot', 
+                    block_size=config.get_block_size()
+                )
                 
                 # Filter valid matches
                 H1, W1 = view1['true_shape'][0]
@@ -351,8 +318,7 @@ def main():
     parser.add_argument('--enable_bbox_filter', action='store_true', help='Enable bounding box filtering based on COLMAP 3D points')
     parser.add_argument('--min_point_visibility', type=int, required=False, help='Minimum visibility (number of images) for COLMAP points used in bounding box computation. Default = 3', default=3)
     parser.add_argument('--bbox_padding_factor', type=float, required=False, help='Additional padding for bounding box as fraction of size. Default = 0.1', default=0.1)
-    # New parameters for matching optimization
-    parser.add_argument('--enable_fast_matching', action='store_true', help='Enable optimized fast matching with better block sizes')
+    # Matching parameters
     parser.add_argument('--block_size_power', type=int, required=False, help='Block size as power of 2 (e.g., 14 for 2^14). Default = 14', default=14)
     args = parser.parse_args()
 
@@ -549,16 +515,14 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
 
             desc1, desc2 = pred1['desc'][i].squeeze(0).detach(), pred2['desc'][i].squeeze(0).detach()
 
-            # Use optimized matching
-            if config.enable_fast_matching:
-                matches_img1, matches_img2 = optimized_fast_matching(
-                    desc1, desc2, 
-                    subsample_factor=config.sampling_factor, 
-                    device=device,
-                    block_size=config.get_block_size()
-                )
-            else:
-                matches_img1, matches_img2 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=config.sampling_factor, device=device, dist='dot', block_size=2**13)
+            # Compute feature matches
+            matches_img1, matches_img2 = fast_reciprocal_NNs(
+                desc1, desc2, 
+                subsample_or_initxy1=config.sampling_factor, 
+                device=device, 
+                dist='dot', 
+                block_size=config.get_block_size()
+            )
 
             # ignore small border around the edge
             H1, W1 = view1['true_shape'][i]

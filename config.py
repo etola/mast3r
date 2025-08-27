@@ -47,8 +47,7 @@ class DensificationConfig:
     min_point_visibility: int = 3
     bbox_padding_factor: float = 0.1
     
-    # Fast matching optimization parameters
-    enable_fast_matching: bool = False
+    # Matching parameters
     block_size_power: int = 14
     
     # Model parameters (fixed for MASt3R)
@@ -135,9 +134,7 @@ class DensificationConfig:
         if self.enable_bbox_filter:
             print(f"    Min point visibility: {self.min_point_visibility}")
             print(f"    Padding factor: {self.bbox_padding_factor}")
-        print(f"  Fast matching: {self.enable_fast_matching}")
-        if self.enable_fast_matching:
-            print(f"    Block size: 2^{self.block_size_power}")
+        print(f"  Block size for matching: 2^{self.block_size_power}")
         print("=" * 60)
     
     def get_block_size(self) -> int:
@@ -163,6 +160,5 @@ def create_config_from_args(args) -> DensificationConfig:
         enable_bbox_filter=args.enable_bbox_filter,
         min_point_visibility=args.min_point_visibility,
         bbox_padding_factor=args.bbox_padding_factor,
-        enable_fast_matching=args.enable_fast_matching,
         block_size_power=args.block_size_power,
     ) 

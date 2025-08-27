@@ -44,9 +44,9 @@ class DensificationConfig:
     depth_consistency_threshold: float = 0.05
     
     # Bounding box filtering parameters
-    enable_bbox_filter: bool = False
+    disable_bbox_filter: bool = False
     min_point_visibility: int = 3
-    bbox_padding_factor: float = 0.1
+    bbox_padding_factor: float = 1.0
     
     # Point cloud outlier removal parameters
     enable_outlier_removal: bool = False
@@ -137,8 +137,8 @@ class DensificationConfig:
             print(f"    Max pairs per image: {self.max_pairs_per_image}")
             print(f"    Min consistent pairs: {self.min_consistent_pairs}")
             print(f"    Depth threshold: {self.depth_consistency_threshold}")
-        print(f"  Bounding box filtering: {self.enable_bbox_filter}")
-        if self.enable_bbox_filter:
+        print(f"  Bounding box filtering: {'Disabled' if self.disable_bbox_filter else 'Enabled (default)'}")
+        if not self.disable_bbox_filter:
             print(f"    Min point visibility: {self.min_point_visibility}")
             print(f"    Padding factor: {self.bbox_padding_factor}")
         print(f"  Outlier removal: {self.enable_outlier_removal}")
@@ -169,7 +169,7 @@ def create_config_from_args(args) -> DensificationConfig:
         max_pairs_per_image=args.max_pairs_per_image,
         min_consistent_pairs=args.min_consistent_pairs,
         depth_consistency_threshold=args.depth_consistency_threshold,
-        enable_bbox_filter=args.enable_bbox_filter,
+        disable_bbox_filter=args.disable_bbox_filter,
         min_point_visibility=args.min_point_visibility,
         bbox_padding_factor=args.bbox_padding_factor,
         enable_outlier_removal=args.enable_outlier_removal,

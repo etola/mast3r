@@ -258,6 +258,7 @@ class ColmapReconstruction:
         
         return bbox_min, bbox_max
     
+
     # Accessor methods for clean API
     def has_image(self, image_id: int) -> bool:
         """Check if an image ID exists in the reconstruction."""

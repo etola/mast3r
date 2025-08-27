@@ -45,10 +45,9 @@ def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
     filtered_points = points[inside_mask]
     filtered_colors = colors[inside_mask]
     
-    print(f"Filtered {len(points)} points to {len(filtered_points)} points inside bounding box")
+    # print(f"Filtered {len(points)} points to {len(filtered_points)} points inside bounding box")
     
     return filtered_points, filtered_colors
-
 
 
 
@@ -234,6 +233,8 @@ def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: 
                 # Compute depths and 3D points
                 depths, points_3d = compute_depth_from_pair(reconstruction, frame_id, partner_id, matches_img1, matches_img2)
                 
+
+                
                 # Store depth information per pixel location
                 image = Image.open(img1_path)
                 img_width, img_height = image.size
@@ -335,10 +336,10 @@ def main():
     parser.add_argument('--min_consistent_pairs', type=int, required=False, help='Minimum number of consistent pairings required to keep a point. Default = 3', default=3)
     parser.add_argument('--depth_consistency_threshold', type=float, required=False, help='Depth consistency threshold as percentage (e.g., 0.05 for 5%%). Default = 0.05', default=0.05)
     parser.add_argument('--enable_consistency_check', action='store_true', help='Enable multi-pairing consistency checking')
-    # New parameters for bounding box filtering
-    parser.add_argument('--enable_bbox_filter', action='store_true', help='Enable bounding box filtering based on COLMAP 3D points')
+    # Bounding box filtering parameters
+    parser.add_argument('--disable_bbox_filter', action='store_true', help='Disable bounding box filtering')
     parser.add_argument('--min_point_visibility', type=int, required=False, help='Minimum visibility (number of images) for COLMAP points used in bounding box computation. Default = 3', default=3)
-    parser.add_argument('--bbox_padding_factor', type=float, required=False, help='Additional padding for bounding box as fraction of size. Default = 0.1', default=0.1)
+    parser.add_argument('--bbox_padding_factor', type=float, required=False, help='Additional padding for bounding box as fraction of size. Default = 1.0', default=1.0)
     # Point cloud outlier removal parameters
     parser.add_argument('--enable_outlier_removal', action='store_true', help='Enable statistical outlier removal from point cloud')
     parser.add_argument('--outlier_nb_neighbors', type=int, required=False, help='Number of neighbors for outlier removal. Default = 20', default=20)
@@ -370,9 +371,9 @@ def main():
     print(f"Loading reconstruction from {config.reconstruction_path}...")
     reconstruction: ColmapReconstruction = colmap_utils.load_reconstruction(config.reconstruction_path)
     
-    # Compute robust bounding box if filtering is enabled
+    # Compute robust bounding box for global filtering
     bbox_min, bbox_max = None, None
-    if config.enable_bbox_filter:
+    if not config.disable_bbox_filter:
         bbox_min, bbox_max = reconstruction.compute_robust_bounding_box(
             min_visibility=config.min_point_visibility, 
             padding_factor=config.bbox_padding_factor
@@ -424,8 +425,8 @@ def main():
             all_points = np.concatenate([all_points, frame_data['points']], axis=0)
             all_colors = np.concatenate([all_colors, frame_data['colors']], axis=0)
 
-    # Apply bounding box filtering if enabled
-    if config.enable_bbox_filter and bbox_min is not None and bbox_max is not None:
+    # Apply global bounding box filtering if enabled
+    if not config.disable_bbox_filter and bbox_min is not None and bbox_max is not None:
         all_points, all_colors = filter_points_by_bounding_box(all_points, all_colors, bbox_min, bbox_max)
 
     # Check if we have any points left after filtering
@@ -462,7 +463,7 @@ def main():
         'final_points_after_filtering': final_points,
         'total_frames_processed': total_frames_processed,
         'processing_time_seconds': end_time - start_time,
-        'bounding_box_filtering_enabled': config.enable_bbox_filter,
+        'bounding_box_filtering_enabled': not config.disable_bbox_filter,
         'consistency_checking_enabled': config.enable_consistency_check,
         'outlier_removal_enabled': config.enable_outlier_removal
     }
@@ -627,6 +628,8 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
 
             # Use the existing triangulation function
             _, triangulated_points = compute_depth_from_pair(reconstruction, img1, img2, matches_img1, matches_img2)
+            
+
 
             # filter out points that are too far from the cameras
             img1_cam = reconstruction.get_image_cam_from_world(img1)

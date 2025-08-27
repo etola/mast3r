@@ -51,7 +51,7 @@ def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
 
 
 
-def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matches_img2, img_dir):
+def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matches_img2):
     """
     Compute depth values for matches in the reference frame (img1) from a pair.
     Returns depths and 3D points in world coordinates.
@@ -231,32 +231,59 @@ def densify_with_consistency_check(reconstruction, pairs, config: DensificationC
                 matches_img2[:, 1] = matches_img2[:, 1] * h2_scale
                 
                 # Compute depths and 3D points
-                depths, points_3d = compute_depth_from_pair(reconstruction, frame_id, partner_id, matches_img1, matches_img2, config.img_dir)
+                depths, points_3d = compute_depth_from_pair(reconstruction, frame_id, partner_id, matches_img1, matches_img2)
                 
                 # Store depth information per pixel location
                 image = Image.open(img1_path)
                 img_width, img_height = image.size
                 
-                for i, (depth, point_3d) in enumerate(zip(depths, points_3d)):
-                    if depth <= 0:  # Skip invalid depths
-                        continue
-                        
-                    x, y = matches_img1[i]
-                    # Round to nearest pixel
-                    pixel_coord = (int(round(x)), int(round(y)))
-                    
-                    # Skip out-of-bounds pixels
-                    if pixel_coord[0] < 0 or pixel_coord[0] >= img_width or pixel_coord[1] < 0 or pixel_coord[1] >= img_height:
-                        continue
+                # Vectorized filtering and processing
+                depths = np.array(depths)
+                points_3d = np.array(points_3d)
+                
+                # Filter valid depths
+                valid_mask = depths > 0
+                valid_depths = depths[valid_mask]
+                valid_points = points_3d[valid_mask]
+                valid_matches = matches_img1[valid_mask]
+                
+                if len(valid_depths) == 0:
+                    continue
+                
+                # Round coordinates and check bounds vectorized
+                pixel_x = np.round(valid_matches[:, 0]).astype(int)
+                pixel_y = np.round(valid_matches[:, 1]).astype(int)
+                
+                # Bounds checking
+                bounds_mask = (
+                    (pixel_x >= 0) & (pixel_x < img_width) & 
+                    (pixel_y >= 0) & (pixel_y < img_height)
+                )
+                
+                # Apply bounds filter
+                valid_depths = valid_depths[bounds_mask]
+                valid_points = valid_points[bounds_mask]
+                pixel_x = pixel_x[bounds_mask]
+                pixel_y = pixel_y[bounds_mask]
+                
+                if len(valid_depths) == 0:
+                    continue
+                
+                # Vectorized color extraction for all valid pixels
+                img_array = np.array(image, dtype=np.float32) / 255.0
+                pixel_colors_array = img_array[pixel_y, pixel_x]
+                
+                # Build dictionaries for valid pixels only
+                for i in range(len(valid_depths)):
+                    pixel_coord = (pixel_x[i], pixel_y[i])
                     
                     if pixel_coord not in pixel_depth_maps:
                         pixel_depth_maps[pixel_coord] = []
                         pixel_points_maps[pixel_coord] = []
-                        # Get color for this pixel
-                        pixel_colors[pixel_coord] = np.array(image.getpixel(pixel_coord), dtype=np.float32) / 255.0
+                        pixel_colors[pixel_coord] = pixel_colors_array[i]
                     
-                    pixel_depth_maps[pixel_coord].append(depth)
-                    pixel_points_maps[pixel_coord].append(point_3d)
+                    pixel_depth_maps[pixel_coord].append(valid_depths[i])
+                    pixel_points_maps[pixel_coord].append(valid_points[i])
                     
             except Exception as e:
                 print(f"Error processing pair {frame_id}-{partner_id}: {e}")
@@ -555,18 +582,8 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
             y_coords = np.clip(matches_img1[:, 1].astype(int), 0, img_height - 1)
             img1_color = img_array[y_coords, x_coords]  # Note: numpy uses [y, x] indexing
 
-            # Get camera matrices (assuming undistorted images)
-            P1 = colmap_utils.get_camera_projection_matrix(int(img1), reconstruction)
-            P2 = colmap_utils.get_camera_projection_matrix(int(img2), reconstruction)
-
-            # Convert matches to homogeneous coordinates for triangulation
-            m1 = matches_img1.astype(np.float64).T
-            m2 = matches_img2.astype(np.float64).T
-
-            triangulated_points = cv2.triangulatePoints(P1, P2, m1, m2)
-            triangulated_points = triangulated_points / triangulated_points[3, :]
-            triangulated_points = triangulated_points[:3, :]
-            triangulated_points = triangulated_points.transpose()
+            # Use the existing triangulation function
+            _, triangulated_points = compute_depth_from_pair(reconstruction, int(img1), int(img2), matches_img1, matches_img2)
 
             # filter out points that are too far from the cameras
             img1_cam = reconstruction.images[int(img1)].cam_from_world()

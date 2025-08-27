@@ -37,6 +37,7 @@ class DensificationConfig:
     use_existing_pairs: bool = False
     cache_memory_gb: float = 16.0
     enable_profiling: bool = True
+
     
     # Multi-pairing consistency parameters
     enable_consistency_check: bool = False
@@ -130,6 +131,7 @@ class DensificationConfig:
         print(f"  Min feature coverage: {self.min_feature_coverage}")
         print(f"  Device: {'CPU' if self.force_cpu else 'GPU (if available)'}")
         print(f"  Image cache memory: {self.cache_memory_gb:.1f}GB")
+
         print(f"  Verbose: {self.verbose}")
         print()
         print("Advanced Options:")
@@ -167,6 +169,7 @@ def create_config_from_args(args) -> DensificationConfig:
         use_existing_pairs=args.use_existing_pairs,
         cache_memory_gb=args.cache_memory_gb,
         enable_profiling=not args.disable_profiling,
+
         enable_consistency_check=args.enable_consistency_check,
         max_pairs_per_image=args.max_pairs_per_image,
         min_consistent_pairs=args.min_consistent_pairs,

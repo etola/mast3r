@@ -7,10 +7,45 @@
 import torch
 import numpy as np
 import math
+import time
+from contextlib import contextmanager
 from scipy.spatial import KDTree
 
 import mast3r.utils.path_to_dust3r  # noqa
 from dust3r.utils.device import to_numpy, todevice  # noqa
+
+
+# Profiling infrastructure for fast_nn module
+_fast_nn_profile_data = {}
+
+@contextmanager
+def _profile_timer(operation_name, enabled=True):
+    """Context manager for timing operations in fast_nn module."""
+    if not enabled:
+        yield
+        return
+        
+    start_time = time.time()
+    try:
+        yield
+    finally:
+        elapsed = time.time() - start_time
+        if operation_name not in _fast_nn_profile_data:
+            _fast_nn_profile_data[operation_name] = {'total_time': 0, 'count': 0, 'times': []}
+        _fast_nn_profile_data[operation_name]['total_time'] += elapsed
+        _fast_nn_profile_data[operation_name]['count'] += 1
+        _fast_nn_profile_data[operation_name]['times'].append(elapsed)
+
+
+def get_fast_nn_profile_data():
+    """Get profiling data for fast_nn operations."""
+    return _fast_nn_profile_data.copy()
+
+
+def clear_fast_nn_profile_data():
+    """Clear profiling data for fast_nn operations."""
+    global _fast_nn_profile_data
+    _fast_nn_profile_data = {}
 
 
 @torch.no_grad()
@@ -107,82 +142,87 @@ def merge_corres(idx1, idx2, shape1=None, shape2=None, ret_xy=True, ret_index=Fa
 
 
 def fast_reciprocal_NNs(pts1, pts2, subsample_or_initxy1=8, ret_xy=True, pixel_tol=0, ret_basin=False,
-                        device='cuda', **matcher_kw):
-    H1, W1, DIM1 = pts1.shape
-    H2, W2, DIM2 = pts2.shape
-    assert DIM1 == DIM2
+                        device='cuda', enable_profiling=True, **matcher_kw):
+    with _profile_timer("Setup and Tensor Preparation", enable_profiling):
+        H1, W1, DIM1 = pts1.shape
+        H2, W2, DIM2 = pts2.shape
+        assert DIM1 == DIM2
 
-    pts1 = pts1.reshape(-1, DIM1)
-    pts2 = pts2.reshape(-1, DIM2)
+        pts1 = pts1.reshape(-1, DIM1)
+        pts2 = pts2.reshape(-1, DIM2)
 
-    if isinstance(subsample_or_initxy1, int) and pixel_tol == 0:
-        S = subsample_or_initxy1
-        y1, x1 = np.mgrid[S // 2:H1:S, S // 2:W1:S].reshape(2, -1)
-        max_iter = 10
-    else:
-        x1, y1 = subsample_or_initxy1
-        if isinstance(x1, torch.Tensor):
-            x1 = x1.cpu().numpy()
-        if isinstance(y1, torch.Tensor):
-            y1 = y1.cpu().numpy()
-        max_iter = 1
+        if isinstance(subsample_or_initxy1, int) and pixel_tol == 0:
+            S = subsample_or_initxy1
+            y1, x1 = np.mgrid[S // 2:H1:S, S // 2:W1:S].reshape(2, -1)
+            max_iter = 10
+        else:
+            x1, y1 = subsample_or_initxy1
+            if isinstance(x1, torch.Tensor):
+                x1 = x1.cpu().numpy()
+            if isinstance(y1, torch.Tensor):
+                y1 = y1.cpu().numpy()
+            max_iter = 1
 
-    xy1 = np.int32(np.unique(x1 + W1 * y1))  # make sure there's no doublons
-    xy2 = np.full_like(xy1, -1)
-    old_xy1 = xy1.copy()
-    old_xy2 = xy2.copy()
+        xy1 = np.int32(np.unique(x1 + W1 * y1))  # make sure there's no doublons
+        xy2 = np.full_like(xy1, -1)
+        old_xy1 = xy1.copy()
+        old_xy2 = xy2.copy()
 
-    if 'dist' in matcher_kw or 'block_size' in matcher_kw \
-            or (isinstance(device, str) and device.startswith('cuda')) \
-            or (isinstance(device, torch.device) and device.type.startswith('cuda')):
-        pts1 = pts1.to(device)
-        pts2 = pts2.to(device)
-        tree1 = cdistMatcher(pts1, device=device)
-        tree2 = cdistMatcher(pts2, device=device)
-    else:
-        pts1, pts2 = to_numpy((pts1, pts2))
-        tree1 = KDTree(pts1)
-        tree2 = KDTree(pts2)
+    with _profile_timer("Tree Building and Device Setup", enable_profiling):
+        if 'dist' in matcher_kw or 'block_size' in matcher_kw \
+                or (isinstance(device, str) and device.startswith('cuda')) \
+                or (isinstance(device, torch.device) and device.type.startswith('cuda')):
+            pts1 = pts1.to(device)
+            pts2 = pts2.to(device)
+            tree1 = cdistMatcher(pts1, device=device)
+            tree2 = cdistMatcher(pts2, device=device)
+        else:
+            pts1, pts2 = to_numpy((pts1, pts2))
+            tree1 = KDTree(pts1)
+            tree2 = KDTree(pts2)
 
-    notyet = np.ones(len(xy1), dtype=bool)
-    basin = np.full((H1 * W1 + 1,), -1, dtype=np.int32) if ret_basin else None
+    with _profile_timer("Iterative Reciprocal Matching", enable_profiling):
+        notyet = np.ones(len(xy1), dtype=bool)
+        basin = np.full((H1 * W1 + 1,), -1, dtype=np.int32) if ret_basin else None
 
-    niter = 0
-    # n_notyet = [len(notyet)]
-    while notyet.any():
-        _, xy2[notyet] = to_numpy(tree2.query(pts1[xy1[notyet]], **matcher_kw))
-        if not ret_basin:
-            notyet &= (old_xy2 != xy2)  # remove points that have converged
+        niter = 0
+        # n_notyet = [len(notyet)]
+        while notyet.any():
+            _, xy2[notyet] = to_numpy(tree2.query(pts1[xy1[notyet]], **matcher_kw))
+            if not ret_basin:
+                notyet &= (old_xy2 != xy2)  # remove points that have converged
 
-        _, xy1[notyet] = to_numpy(tree1.query(pts2[xy2[notyet]], **matcher_kw))
-        if ret_basin:
-            basin[old_xy1[notyet]] = xy1[notyet]
-        notyet &= (old_xy1 != xy1)  # remove points that have converged
+            _, xy1[notyet] = to_numpy(tree1.query(pts2[xy2[notyet]], **matcher_kw))
+            if ret_basin:
+                basin[old_xy1[notyet]] = xy1[notyet]
+            notyet &= (old_xy1 != xy1)  # remove points that have converged
 
-        # n_notyet.append(notyet.sum())
-        niter += 1
-        if niter >= max_iter:
-            break
+            # n_notyet.append(notyet.sum())
+            niter += 1
+            if niter >= max_iter:
+                break
 
-        old_xy2[:] = xy2
-        old_xy1[:] = xy1
+            old_xy2[:] = xy2
+            old_xy1[:] = xy1
 
-    # print('notyet_stats:', ' '.join(map(str, (n_notyet+[0]*10)[:max_iter])))
+        # print('notyet_stats:', ' '.join(map(str, (n_notyet+[0]*10)[:max_iter])))
 
-    if pixel_tol > 0:
-        # in case we only want to match some specific points
-        # and still have some way of checking reciprocity
-        old_yx1 = np.unravel_index(old_xy1, (H1, W1))[0].base
-        new_yx1 = np.unravel_index(xy1, (H1, W1))[0].base
-        dis = np.linalg.norm(old_yx1 - new_yx1, axis=-1)
-        converged = dis < pixel_tol
-        if not isinstance(subsample_or_initxy1, int):
-            xy1 = old_xy1  # replace new points by old ones
-    else:
-        converged = ~notyet  # converged correspondences
+    with _profile_timer("Post-processing and Merging", enable_profiling):
+        if pixel_tol > 0:
+            # in case we only want to match some specific points
+            # and still have some way of checking reciprocity
+            old_yx1 = np.unravel_index(old_xy1, (H1, W1))[0].base
+            new_yx1 = np.unravel_index(xy1, (H1, W1))[0].base
+            dis = np.linalg.norm(old_yx1 - new_yx1, axis=-1)
+            converged = dis < pixel_tol
+            if not isinstance(subsample_or_initxy1, int):
+                xy1 = old_xy1  # replace new points by old ones
+        else:
+            converged = ~notyet  # converged correspondences
 
-    # keep only unique correspondences, and sort on xy1
-    xy1, xy2 = merge_corres(xy1[converged], xy2[converged], (H1, W1), (H2, W2), ret_xy=ret_xy)
+        # keep only unique correspondences, and sort on xy1
+        xy1, xy2 = merge_corres(xy1[converged], xy2[converged], (H1, W1), (H2, W2), ret_xy=ret_xy)
+    
     if ret_basin:
         return xy1, xy2, basin
     return xy1, xy2

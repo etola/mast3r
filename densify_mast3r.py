@@ -15,7 +15,7 @@ import argparse
 from contextlib import contextmanager
 
 from mast3r.model import AsymmetricMASt3R
-from mast3r.fast_nn import fast_reciprocal_NNs
+from mast3r.fast_nn import fast_reciprocal_NNs, get_fast_nn_profile_data, clear_fast_nn_profile_data
 
 import mast3r.utils.path_to_dust3r 
 from image_io import load_images, initialize_cache, print_cache_stats
@@ -50,20 +50,32 @@ def profile_timer(operation_name, enabled=True):
 
 def print_profiling_summary(enabled=True):
     """Print a comprehensive profiling summary."""
-    if not enabled or not profile_data:
+    if not enabled:
+        return
+        
+    # Merge fast_nn profiling data into main profile_data
+    fast_nn_data = get_fast_nn_profile_data()
+    combined_data = profile_data.copy()
+    
+    # Add fast_nn data with prefixes for clarity
+    for operation, data in fast_nn_data.items():
+        prefixed_operation = f"FastNN: {operation}"
+        combined_data[prefixed_operation] = data
+    
+    if not combined_data:
         return
         
     print("\n" + "=" * 80)
     print("PROFILING SUMMARY")
     print("=" * 80)
     
-    total_measured_time = sum(data['total_time'] for data in profile_data.values())
+    total_measured_time = sum(data['total_time'] for data in combined_data.values())
     
     # Sort by total time spent
-    sorted_operations = sorted(profile_data.items(), key=lambda x: x[1]['total_time'], reverse=True)
+    sorted_operations = sorted(combined_data.items(), key=lambda x: x[1]['total_time'], reverse=True)
     
-    print(f"{'Operation':<35} {'Total Time':<12} {'Count':<8} {'Avg Time':<12} {'Percentage':<10}")
-    print("-" * 80)
+    print(f"{'Operation':<45} {'Total Time':<12} {'Count':<8} {'Avg Time':<12} {'Percentage':<10}")
+    print("-" * 90)
     
     for operation, data in sorted_operations:
         total_time = data['total_time']
@@ -71,11 +83,11 @@ def print_profiling_summary(enabled=True):
         avg_time = total_time / count if count > 0 else 0
         percentage = (total_time / total_measured_time * 100) if total_measured_time > 0 else 0
         
-        print(f"{operation:<35} {total_time:<12.3f} {count:<8} {avg_time:<12.3f} {percentage:<10.1f}%")
+        print(f"{operation:<45} {total_time:<12.3f} {count:<8} {avg_time:<12.3f} {percentage:<10.1f}%")
     
-    print("-" * 80)
-    print(f"{'Total measured time:':<35} {total_measured_time:<12.3f}")
-    print("=" * 80)
+    print("-" * 90)
+    print(f"{'Total measured time:':<45} {total_measured_time:<12.3f}")
+    print("=" * 90)
 
 
 def save_profiling_data(output_path, enabled=True):
@@ -286,7 +298,8 @@ def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: 
                         subsample_or_initxy1=config.sampling_factor, 
                         device=device, 
                         dist='dot', 
-                        block_size=config.get_block_size()
+                        block_size=config.get_block_size(),
+                        enable_profiling=config.enable_profiling
                     )
                 
                 # Filter valid matches
@@ -418,6 +431,7 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--cache_memory_gb', type=float, default=16.0, help='Maximum memory for image cache in GB (default: 16.0)')
     parser.add_argument('--disable_profiling', action='store_true', help='Disable performance profiling output')
+
     parser.add_argument('-f', '--sampling_factor', type=int, required=False, help='Sampling factor for point triangulation. Lower = denser. User powers of 2. Default = 8', default=8)
     parser.add_argument('-m', '--min_feature_coverage', type=float, required=False, help='Minimum proportion of image that must be covered by shared points to be considered a good match. Default = 0.6', default=0.6)
     # New parameters for multi-pairing consistency
@@ -448,6 +462,9 @@ def main():
     # Initialize image cache for efficient loading and resizing
     cache_memory_gb = getattr(config, 'cache_memory_gb', 16.0)  # Default to 16GB if not specified
     initialize_cache(max_memory_gb=cache_memory_gb)
+    
+    # Clear any existing profiling data for clean measurements
+    clear_fast_nn_profile_data()
     
     # Check if existing pairs file should be used
     if config.use_existing_pairs and not os.path.exists(config.pairs_path):
@@ -696,7 +713,8 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
                     subsample_or_initxy1=config.sampling_factor, 
                     device=device, 
                     dist='dot', 
-                    block_size=config.get_block_size()
+                    block_size=config.get_block_size(),
+                    enable_profiling=config.enable_profiling
                 )
 
             # ignore small border around the edge

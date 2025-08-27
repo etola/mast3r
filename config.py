@@ -36,6 +36,7 @@ class DensificationConfig:
     verbose: bool = False
     use_existing_pairs: bool = False
     cache_memory_gb: float = 16.0
+    enable_profiling: bool = True
     
     # Multi-pairing consistency parameters
     enable_consistency_check: bool = False
@@ -165,6 +166,7 @@ def create_config_from_args(args) -> DensificationConfig:
         verbose=args.verbose,
         use_existing_pairs=args.use_existing_pairs,
         cache_memory_gb=args.cache_memory_gb,
+        enable_profiling=not args.disable_profiling,
         enable_consistency_check=args.enable_consistency_check,
         max_pairs_per_image=args.max_pairs_per_image,
         min_consistent_pairs=args.min_consistent_pairs,

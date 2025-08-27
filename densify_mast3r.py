@@ -12,6 +12,7 @@ from PIL import Image
 import cv2
 import time
 import argparse
+from contextlib import contextmanager
 
 from mast3r.model import AsymmetricMASt3R
 from mast3r.fast_nn import fast_reciprocal_NNs
@@ -23,6 +24,88 @@ from dust3r.inference import inference
 import colmap_utils
 from colmap_utils import ColmapReconstruction
 from config import DensificationConfig, create_config_from_args
+
+
+# Global profiling dictionary
+profile_data = {}
+
+@contextmanager
+def profile_timer(operation_name, enabled=True):
+    """Context manager for timing operations and accumulating results."""
+    if not enabled:
+        yield
+        return
+        
+    start_time = time.time()
+    try:
+        yield
+    finally:
+        elapsed = time.time() - start_time
+        if operation_name not in profile_data:
+            profile_data[operation_name] = {'total_time': 0, 'count': 0, 'times': []}
+        profile_data[operation_name]['total_time'] += elapsed
+        profile_data[operation_name]['count'] += 1
+        profile_data[operation_name]['times'].append(elapsed)
+
+
+def print_profiling_summary(enabled=True):
+    """Print a comprehensive profiling summary."""
+    if not enabled or not profile_data:
+        return
+        
+    print("\n" + "=" * 80)
+    print("PROFILING SUMMARY")
+    print("=" * 80)
+    
+    total_measured_time = sum(data['total_time'] for data in profile_data.values())
+    
+    # Sort by total time spent
+    sorted_operations = sorted(profile_data.items(), key=lambda x: x[1]['total_time'], reverse=True)
+    
+    print(f"{'Operation':<35} {'Total Time':<12} {'Count':<8} {'Avg Time':<12} {'Percentage':<10}")
+    print("-" * 80)
+    
+    for operation, data in sorted_operations:
+        total_time = data['total_time']
+        count = data['count']
+        avg_time = total_time / count if count > 0 else 0
+        percentage = (total_time / total_measured_time * 100) if total_measured_time > 0 else 0
+        
+        print(f"{operation:<35} {total_time:<12.3f} {count:<8} {avg_time:<12.3f} {percentage:<10.1f}%")
+    
+    print("-" * 80)
+    print(f"{'Total measured time:':<35} {total_measured_time:<12.3f}")
+    print("=" * 80)
+
+
+def save_profiling_data(output_path, enabled=True):
+    """Save profiling data to a JSON file for analysis."""
+    if not enabled or not profile_data:
+        return
+        
+    # Prepare data for JSON serialization (remove numpy arrays etc.)
+    json_data = {}
+    for operation, data in profile_data.items():
+        json_data[operation] = {
+            'total_time': float(data['total_time']),
+            'count': int(data['count']),
+            'avg_time': float(data['total_time'] / data['count']) if data['count'] > 0 else 0.0,
+            'times': [float(t) for t in data['times']]
+        }
+    
+    # Add summary statistics
+    total_measured_time = sum(data['total_time'] for data in profile_data.values())
+    json_data['_summary'] = {
+        'total_measured_time': float(total_measured_time),
+        'operation_count': len(profile_data),
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+    }
+    
+    with open(output_path, 'w') as f:
+        json.dump(json_data, f, indent=2)
+    
+    print(f"Profiling data saved to {output_path}")
+
 
 def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
     """
@@ -153,7 +236,8 @@ def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: 
     device = config.get_device()
     
     # load the model
-    model = AsymmetricMASt3R.from_pretrained(config.model_path, verbose=config.verbose).to(device)
+    with profile_timer("Model Loading (Consistency Check)", config.enable_profiling):
+        model = AsymmetricMASt3R.from_pretrained(config.model_path, verbose=config.verbose).to(device)
 
     # Dictionary to store final consistent point clouds per frame
     frame_clouds = {}
@@ -182,11 +266,13 @@ def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: 
             img2_path = os.path.join(config.img_dir, img2_name)
             
             try:
-                images = load_images([img1_path, img2_path], size=config.size)
-                image_pair = tuple([images[0], images[1]])
+                with profile_timer("Image Loading (Consistency)", config.enable_profiling):
+                    images = load_images([img1_path, img2_path], size=config.size)
+                    image_pair = tuple([images[0], images[1]])
                 
                 # Get predictions
-                output = inference([image_pair], model=model, device=device, batch_size=1, verbose=config.verbose)
+                with profile_timer("Model Inference (Consistency)", config.enable_profiling):
+                    output = inference([image_pair], model=model, device=device, batch_size=1, verbose=config.verbose)
                 
                 view1, pred1 = output['view1'], output['pred1']
                 view2, pred2 = output['view2'], output['pred2']
@@ -194,13 +280,14 @@ def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: 
                 desc1, desc2 = pred1['desc'][0].squeeze(0).detach(), pred2['desc'][0].squeeze(0).detach()
                 
                 # Compute feature matches
-                matches_img1, matches_img2 = fast_reciprocal_NNs(
-                    desc1, desc2, 
-                    subsample_or_initxy1=config.sampling_factor, 
-                    device=device, 
-                    dist='dot', 
-                    block_size=config.get_block_size()
-                )
+                with profile_timer("Feature Matching (Consistency)", config.enable_profiling):
+                    matches_img1, matches_img2 = fast_reciprocal_NNs(
+                        desc1, desc2, 
+                        subsample_or_initxy1=config.sampling_factor, 
+                        device=device, 
+                        dist='dot', 
+                        block_size=config.get_block_size()
+                    )
                 
                 # Filter valid matches
                 H1, W1 = view1['true_shape'][0]
@@ -231,7 +318,8 @@ def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: 
                 matches_img2[:, 1] = matches_img2[:, 1] * h2_scale
                 
                 # Compute depths and 3D points
-                depths, points_3d = compute_depth_from_pair(reconstruction, frame_id, partner_id, matches_img1, matches_img2)
+                with profile_timer("Triangulation (Consistency)", config.enable_profiling):
+                    depths, points_3d = compute_depth_from_pair(reconstruction, frame_id, partner_id, matches_img1, matches_img2)
                 
 
                 
@@ -329,6 +417,7 @@ def main():
     parser.add_argument('-c', '--force_cpu', action='store_true', help='Force CPU inference instead of CUDA')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--cache_memory_gb', type=float, default=16.0, help='Maximum memory for image cache in GB (default: 16.0)')
+    parser.add_argument('--disable_profiling', action='store_true', help='Disable performance profiling output')
     parser.add_argument('-f', '--sampling_factor', type=int, required=False, help='Sampling factor for point triangulation. Lower = denser. User powers of 2. Default = 8', default=8)
     parser.add_argument('-m', '--min_feature_coverage', type=float, required=False, help='Minimum proportion of image that must be covered by shared points to be considered a good match. Default = 0.6', default=0.6)
     # New parameters for multi-pairing consistency
@@ -368,16 +457,18 @@ def main():
     torch.cuda.empty_cache()
     start_time = time.time()
 
-    print(f"Loading reconstruction from {config.reconstruction_path}...")
-    reconstruction: ColmapReconstruction = colmap_utils.load_reconstruction(config.reconstruction_path)
+    with profile_timer("Reconstruction Loading", config.enable_profiling):
+        print(f"Loading reconstruction from {config.reconstruction_path}...")
+        reconstruction: ColmapReconstruction = colmap_utils.load_reconstruction(config.reconstruction_path)
     
     # Compute robust bounding box for global filtering
     bbox_min, bbox_max = None, None
     if not config.disable_bbox_filter:
-        bbox_min, bbox_max = reconstruction.compute_robust_bounding_box(
-            min_visibility=config.min_point_visibility, 
-            padding_factor=config.bbox_padding_factor
-        )
+        with profile_timer("Bounding Box Computation", config.enable_profiling):
+            bbox_min, bbox_max = reconstruction.compute_robust_bounding_box(
+                min_visibility=config.min_point_visibility, 
+                padding_factor=config.bbox_padding_factor
+            )
     
     # Save configuration for debugging/reproducibility
     config_path = os.path.join(config.scene_dir, config.output_dir, 'config.json')
@@ -385,21 +476,26 @@ def main():
     print(f"Saved configuration to {config_path}")
 
     if not config.use_existing_pairs:
-        pairs = reconstruction.get_best_pairs(
-            min_feature_coverage=config.min_feature_coverage,
-            pairs_per_image=config.max_pairs_per_image
-        )
-        with open(config.pairs_path, 'w') as f:
-            print(f"Saving pairs to {config.pairs_path}...")
-            json.dump(pairs, f, indent=4)
+        with profile_timer("Pair Selection", config.enable_profiling):
+            pairs = reconstruction.get_best_pairs(
+                min_feature_coverage=config.min_feature_coverage,
+                pairs_per_image=config.max_pairs_per_image
+            )
+        with profile_timer("Pairs Saving", config.enable_profiling):
+            with open(config.pairs_path, 'w') as f:
+                print(f"Saving pairs to {config.pairs_path}...")
+                json.dump(pairs, f, indent=4)
     else:
-        pairs = json.load(open(config.pairs_path))
-        print(f"Loaded pairs from {config.pairs_path}...")
+        with profile_timer("Pairs Loading", config.enable_profiling):
+            pairs = json.load(open(config.pairs_path))
+            print(f"Loaded pairs from {config.pairs_path}...")
 
     if config.enable_consistency_check:
-        densified_frames = densify_with_consistency_check(reconstruction, pairs, config)
+        with profile_timer("Main Densification (Consistency Check)", config.enable_profiling):
+            densified_frames = densify_with_consistency_check(reconstruction, pairs, config)
     else:
-        densified_pairs = densify_pairs_mast3r_batch(reconstruction, pairs, config)
+        with profile_timer("Main Densification (Batch Processing)", config.enable_profiling):
+            densified_pairs = densify_pairs_mast3r_batch(reconstruction, pairs, config)
         # Convert to the expected format for backwards compatibility
         densified_frames = {}
         for img1, data in densified_pairs.items():
@@ -410,6 +506,13 @@ def main():
     
     # Print cache statistics
     print_cache_stats()
+    
+    # Print profiling summary
+    print_profiling_summary(config.enable_profiling)
+    
+    # Save profiling data to JSON file
+    profiling_path = os.path.join(config.scene_dir, config.output_dir, 'profiling_data.json')
+    save_profiling_data(profiling_path, config.enable_profiling)
 
     # Combine all points from different frames
     all_points = None
@@ -427,7 +530,8 @@ def main():
 
     # Apply global bounding box filtering if enabled
     if not config.disable_bbox_filter and bbox_min is not None and bbox_max is not None:
-        all_points, all_colors = filter_points_by_bounding_box(all_points, all_colors, bbox_min, bbox_max)
+        with profile_timer("Global Bounding Box Filtering", config.enable_profiling):
+            all_points, all_colors = filter_points_by_bounding_box(all_points, all_colors, bbox_min, bbox_max)
 
     # Check if we have any points left after filtering
     if all_points is None or len(all_points) == 0:
@@ -435,25 +539,28 @@ def main():
         return
 
     # Create and save point cloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(all_points)
-    pcd.colors = o3d.utility.Vector3dVector(all_colors)
+    with profile_timer("Point Cloud Creation", config.enable_profiling):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(all_points)
+        pcd.colors = o3d.utility.Vector3dVector(all_colors)
     
     # Apply statistical outlier removal if enabled
     if config.enable_outlier_removal:
-        print(f"Removing statistical outliers (neighbors={config.outlier_nb_neighbors}, std_ratio={config.outlier_std_ratio})...")
-        points_before = len(pcd.points)
-        pcd, outlier_indices = pcd.remove_statistical_outlier(
-            nb_neighbors=config.outlier_nb_neighbors, 
-            std_ratio=config.outlier_std_ratio
-        )
-        points_after = len(pcd.points)
-        outliers_removed = points_before - points_after
-        print(f"Removed {outliers_removed:,} outlier points ({outliers_removed/points_before*100:.1f}%)")
-        print(f"Final point cloud: {points_after:,} points")
+        with profile_timer("Statistical Outlier Removal", config.enable_profiling):
+            print(f"Removing statistical outliers (neighbors={config.outlier_nb_neighbors}, std_ratio={config.outlier_std_ratio})...")
+            points_before = len(pcd.points)
+            pcd, outlier_indices = pcd.remove_statistical_outlier(
+                nb_neighbors=config.outlier_nb_neighbors, 
+                std_ratio=config.outlier_std_ratio
+            )
+            points_after = len(pcd.points)
+            outliers_removed = points_before - points_after
+            print(f"Removed {outliers_removed:,} outlier points ({outliers_removed/points_before*100:.1f}%)")
+            print(f"Final point cloud: {points_after:,} points")
 
     # Save point cloud
-    o3d.io.write_point_cloud(config.output_path, pcd)
+    with profile_timer("Point Cloud Saving", config.enable_profiling):
+        o3d.io.write_point_cloud(config.output_path, pcd)
     
     # Save processing summary
     summary_path = os.path.join(config.scene_dir, config.output_dir, 'processing_summary.json')
@@ -506,7 +613,8 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
     device = config.get_device()
     
     # load the model
-    model = AsymmetricMASt3R.from_pretrained(config.model_path, verbose=config.verbose).to(device)
+    with profile_timer("Model Loading (Batch)", config.enable_profiling):
+        model = AsymmetricMASt3R.from_pretrained(config.model_path, verbose=config.verbose).to(device)
 
     # Dictionary to store final point clouds per frame (similar to consistency check)
     frame_clouds = {}
@@ -552,21 +660,24 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
             img_id_to_idx[image_idx] = len(image_paths) - 1
 
         # load all images in the batch
-        print("loading images...")
-        images = load_images(image_paths, size=config.size)
+        with profile_timer("Image Loading (Batch)", config.enable_profiling):
+            print("loading images...")
+            images = load_images(image_paths, size=config.size)
 
         # pair up the images using pair_info
-        for img1, img2 in pair_info:
-            img1_idx = img_id_to_idx[img1]
-            img2_idx = img_id_to_idx[img2]
-            image_batch.append(tuple([images[img1_idx], images[img2_idx]]))
-            cam_1 = reconstruction.get_image_camera(img1)
-            cam_2 = reconstruction.get_image_camera(img2)
-            image_batch_sizes.append([tuple([cam_1.width, cam_1.height]), tuple([cam_2.width, cam_2.height])])
+        with profile_timer("Batch Preparation", config.enable_profiling):
+            for img1, img2 in pair_info:
+                img1_idx = img_id_to_idx[img1]
+                img2_idx = img_id_to_idx[img2]
+                image_batch.append(tuple([images[img1_idx], images[img2_idx]]))
+                cam_1 = reconstruction.get_image_camera(img1)
+                cam_2 = reconstruction.get_image_camera(img2)
+                image_batch_sizes.append([tuple([cam_1.width, cam_1.height]), tuple([cam_2.width, cam_2.height])])
 
         # get predictions for each image pair
-        print(f"Processing {len(image_batch)} pairs in this batch...")
-        output = inference(image_batch, model=model, device=device, batch_size=config.batch_size, verbose=config.verbose)
+        with profile_timer("Model Inference (Batch)", config.enable_profiling):
+            print(f"Processing {len(image_batch)} pairs in this batch...")
+            output = inference(image_batch, model=model, device=device, batch_size=config.batch_size, verbose=config.verbose)
 
         # triangulate each image pair
         print("triangulating...")
@@ -579,13 +690,14 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
             desc1, desc2 = pred1['desc'][i].squeeze(0).detach(), pred2['desc'][i].squeeze(0).detach()
 
             # Compute feature matches
-            matches_img1, matches_img2 = fast_reciprocal_NNs(
-                desc1, desc2, 
-                subsample_or_initxy1=config.sampling_factor, 
-                device=device, 
-                dist='dot', 
-                block_size=config.get_block_size()
-            )
+            with profile_timer("Feature Matching (Batch)", config.enable_profiling):
+                matches_img1, matches_img2 = fast_reciprocal_NNs(
+                    desc1, desc2, 
+                    subsample_or_initxy1=config.sampling_factor, 
+                    device=device, 
+                    dist='dot', 
+                    block_size=config.get_block_size()
+                )
 
             # ignore small border around the edge
             H1, W1 = view1['true_shape'][i]
@@ -627,7 +739,8 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
             img1_color = img_array[y_coords, x_coords]  # Note: numpy uses [y, x] indexing
 
             # Use the existing triangulation function
-            _, triangulated_points = compute_depth_from_pair(reconstruction, img1, img2, matches_img1, matches_img2)
+            with profile_timer("Triangulation (Batch)", config.enable_profiling):
+                _, triangulated_points = compute_depth_from_pair(reconstruction, img1, img2, matches_img1, matches_img2)
             
 
 

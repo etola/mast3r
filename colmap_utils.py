@@ -14,6 +14,7 @@ import numpy as np
 import random
 import pycolmap
 from typing import Optional, Dict, Set, Tuple, List
+from tqdm import tqdm
 
 
 class ColmapReconstruction:
@@ -182,10 +183,9 @@ class ColmapReconstruction:
         
         self._ensure_image_point_maps()
         
-        # Process each image
-        for i, image in enumerate(self.reconstruction.images.values()):
-            print(f"Getting best corresponding image for {image.name}... {i}/{len(self.reconstruction.images) - 1}")
-            
+        # Process each image with progress bar
+        image_list = list(self.reconstruction.images.values())
+        for image in tqdm(image_list, desc="Selecting image pairs", unit="img"):
             # Find the best partners for this image using the extracted function
             best_partner_ids = self._find_best_partner_for_image(
                 image_id=image.image_id,

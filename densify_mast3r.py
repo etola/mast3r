@@ -71,7 +71,7 @@ def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matc
     triangulated_points = triangulated_points.transpose()
 
     # Compute depths in camera 1's reference frame
-    img1_cam = reconstruction.images[img1_id].cam_from_world()
+    img1_cam = reconstruction.get_image_cam_from_world(img1_id)
     img1_R = img1_cam.rotation.matrix()
     img1_t = img1_cam.translation
     
@@ -172,12 +172,12 @@ def densify_with_consistency_check(reconstruction, pairs, config: DensificationC
         
         # Process each pairing for this frame
         for partner_id in partner_ids:
-            if frame_id not in reconstruction.images or partner_id not in reconstruction.images:
+            if not reconstruction.has_image(frame_id) or not reconstruction.has_image(partner_id):
                 continue
                 
             # Load images for this pair
-            img1_name = reconstruction.images[frame_id].name
-            img2_name = reconstruction.images[partner_id].name
+            img1_name = reconstruction.get_image_name(frame_id)
+            img2_name = reconstruction.get_image_name(partner_id)
             img1_path = os.path.join(config.img_dir, img1_name)
             img2_path = os.path.join(config.img_dir, img2_name)
             
@@ -218,8 +218,8 @@ def densify_with_consistency_check(reconstruction, pairs, config: DensificationC
                     continue
                 
                 # Rescale matches to original image size
-                cam1 = reconstruction.images[frame_id].camera
-                cam2 = reconstruction.images[partner_id].camera
+                cam1 = reconstruction.get_image_camera(frame_id)
+                cam2 = reconstruction.get_image_camera(partner_id)
                 w1_scale = cam1.width / config.model_w
                 h1_scale = cam1.height / config.model_h
                 w2_scale = cam2.width / config.model_w
@@ -363,8 +363,7 @@ def main():
     # Compute robust bounding box if filtering is enabled
     bbox_min, bbox_max = None, None
     if config.enable_bbox_filter:
-        bbox_min, bbox_max = colmap_utils.compute_robust_bounding_box(
-            reconstruction, 
+        bbox_min, bbox_max = reconstruction.compute_robust_bounding_box(
             min_visibility=config.min_point_visibility, 
             padding_factor=config.bbox_padding_factor
         )
@@ -376,13 +375,12 @@ def main():
 
     if not config.use_existing_pairs:
         if config.enable_consistency_check:
-            pairs = colmap_utils.get_multiple_pairs_per_image(
-                reconstruction, 
+            pairs = reconstruction.get_multiple_pairs_per_image(
                 max_pairs_per_image=config.max_pairs_per_image, 
                 min_feature_coverage=config.min_feature_coverage
             )
         else:
-            pairs = colmap_utils.get_best_pairs(reconstruction, min_feature_coverage=config.min_feature_coverage)
+            pairs = reconstruction.get_best_pairs(min_feature_coverage=config.min_feature_coverage)
         with open(config.pairs_path, 'w') as f:
             print(f"Saving pairs to {config.pairs_path}...")
             json.dump(pairs, f, indent=4)
@@ -474,22 +472,33 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
     # load the model
     model = AsymmetricMASt3R.from_pretrained(config.model_path, verbose=config.verbose).to(device)
 
-    # initialize empty dict of image_id to np.ndarray of point3D_ids
-    densified_pairs = {}
+    # Dictionary to store final point clouds per frame (similar to consistency check)
+    frame_clouds = {}
 
     def densify_batch(pair_batch):
         image_batch = []
         image_batch_sizes = []
         img_id_to_idx = {}
         image_paths = []
+        pair_info = []  # Store (img1, img2) tuples for tracking
 
         # get all image indices that appear in pair_batch
         image_indices = set()
-        for img1, img2 in pair_batch.items():
-            if int(img1) not in reconstruction.images or int(img2) not in reconstruction.images:
+        for img1, img2_list in pair_batch.items():
+            if not reconstruction.has_image(int(img1)):
                 continue
-            image_indices.add(int(img1))
-            image_indices.add(int(img2))
+            # Handle both single partner and multiple partners format
+            if isinstance(img2_list, list):
+                partners = img2_list
+            else:
+                partners = [img2_list]
+            
+            for img2 in partners:
+                if not reconstruction.has_image(int(img2)):
+                    continue
+                image_indices.add(int(img1))
+                image_indices.add(int(img2))
+                pair_info.append((int(img1), int(img2)))
 
         # Skip this batch if no valid images found
         if not image_indices:
@@ -498,7 +507,7 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
 
         # get the image paths for the image indices
         for image_idx in image_indices:
-            img_name = reconstruction.images[image_idx].name
+            img_name = reconstruction.get_image_name(image_idx)
             img_path = os.path.join(config.img_dir, img_name)
             image_paths.append(img_path)
             img_id_to_idx[image_idx] = len(image_paths) - 1
@@ -507,15 +516,13 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
         print("loading images...")
         images = load_images(image_paths, size=config.size)
 
-        # pair up the images
-        for img1, img2 in pair_batch.items():
-            if int(img1) not in reconstruction.images or int(img2) not in reconstruction.images:
-                continue
-            img1_idx = img_id_to_idx[int(img1)]
-            img2_idx = img_id_to_idx[int(img2)]
+        # pair up the images using pair_info
+        for img1, img2 in pair_info:
+            img1_idx = img_id_to_idx[img1]
+            img2_idx = img_id_to_idx[img2]
             image_batch.append(tuple([images[img1_idx], images[img2_idx]]))
-            cam_1 = reconstruction.images[int(img1)].camera
-            cam_2 = reconstruction.images[int(img2)].camera
+            cam_1 = reconstruction.get_image_camera(img1)
+            cam_2 = reconstruction.get_image_camera(img2)
             image_batch_sizes.append([tuple([cam_1.width, cam_1.height]), tuple([cam_2.width, cam_2.height])])
 
         # get predictions for each image pair
@@ -524,10 +531,7 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
         # triangulate each image pair
         print("triangulating...")
         for i in range(len(image_batch)):
-            img1, img2 = list(pair_batch.items())[i]
-
-            if int(img1) not in reconstruction.images or int(img2) not in reconstruction.images:
-                continue
+            img1, img2 = pair_info[i]
 
             view1, pred1 = output['view1'], output['pred1']
             view2, pred2 = output['view2'], output['pred2']
@@ -572,7 +576,7 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
             matches_img2[:, 1] = matches_img2[:, 1] * h2_scale
 
             # get colors from image 1
-            img1_path = os.path.join(config.img_dir, reconstruction.images[int(img1)].name)
+            img1_path = os.path.join(config.img_dir, reconstruction.get_image_name(img1))
             image = Image.open(img1_path)
             img_width, img_height = image.size  # Get actual image dimensions
             
@@ -583,22 +587,22 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
             img1_color = img_array[y_coords, x_coords]  # Note: numpy uses [y, x] indexing
 
             # Use the existing triangulation function
-            _, triangulated_points = compute_depth_from_pair(reconstruction, int(img1), int(img2), matches_img1, matches_img2)
+            _, triangulated_points = compute_depth_from_pair(reconstruction, img1, img2, matches_img1, matches_img2)
 
             # filter out points that are too far from the cameras
-            img1_cam = reconstruction.images[int(img1)].cam_from_world()
+            img1_cam = reconstruction.get_image_cam_from_world(img1)
             img1_R = img1_cam.rotation.matrix()
             img1_t = img1_cam.translation
 
-            img2_cam = reconstruction.images[int(img2)].cam_from_world()
+            img2_cam = reconstruction.get_image_cam_from_world(img2)
             img2_R = img2_cam.rotation.matrix()
             img2_t = img2_cam.translation
 
             # Get camera centers using helper functions
-            img1_C = colmap_utils.get_camera_center(int(img1), reconstruction)
-            img2_C = colmap_utils.get_camera_center(int(img2), reconstruction)
+            img1_C = colmap_utils.get_camera_center(img1, reconstruction)
+            img2_C = colmap_utils.get_camera_center(img2, reconstruction)
 
-            baseline = colmap_utils.compute_baseline(int(img1), int(img2), reconstruction)
+            baseline = colmap_utils.compute_baseline(img1, img2, reconstruction)
 
             # filter out points that are too far from the cameras (parallax stand-in)
             dist_to_cameras = np.linalg.norm(triangulated_points - img1_C, axis=1)
@@ -612,14 +616,22 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
 
             # TODO: filter out points that violate epipolar constraint
 
-            # # [OPTIONAL] add the image point to the triangulated points
-            # triangulated_points = np.concatenate([triangulated_points, img1_C.reshape(-1, 3)], axis=0)
-            # img1_color = np.concatenate([img1_color, np.array([1, 0, 0]).reshape(1, 3)], axis=0)
-
-            densified_pairs[img1] = {
-                'points': triangulated_points,
-                'colors': img1_color
-            }
+            # Accumulate points for this frame (img1)
+            if img1 not in frame_clouds:
+                frame_clouds[img1] = {
+                    'points': triangulated_points,
+                    'colors': img1_color
+                }
+            else:
+                # Concatenate with existing points for this frame
+                frame_clouds[img1]['points'] = np.concatenate([
+                    frame_clouds[img1]['points'], 
+                    triangulated_points
+                ], axis=0)
+                frame_clouds[img1]['colors'] = np.concatenate([
+                    frame_clouds[img1]['colors'], 
+                    img1_color
+                ], axis=0)
 
     num_batches = len(pairs) // config.batch_size
     batches = []
@@ -630,7 +642,7 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
     for batch in batches:
         densify_batch(batch)
     
-    return densified_pairs
+    return frame_clouds
 
 
 

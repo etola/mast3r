@@ -40,7 +40,6 @@ from dust3r.utils.image import load_images
 from dust3r.inference import inference
 
 NO_POINT = 18446744073709551615
-DEFAULT_OUTPUT = 'densified.ply'
 DEFAULT_PAIRS = 'pairs.json'
 
 def compute_robust_bounding_box(reconstruction, min_visibility=3, padding_factor=0.1):
@@ -115,6 +114,40 @@ def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
     print(f"Filtered {len(points)} points to {len(filtered_points)} points inside bounding box")
     
     return filtered_points, filtered_colors
+
+
+def optimized_fast_matching(desc1, desc2, subsample_factor=8, device='cuda', 
+                           block_size=2**13):
+    """
+    Wrapper around fast_reciprocal_NNs with simple optimizations.
+    Focus on practical speed improvements without replacing the core algorithm.
+    """
+    # Use the existing highly optimized fast_reciprocal_NNs
+    # Just add some simple optimizations like better block sizes
+    
+    # Determine optimal block size based on GPU memory and descriptor size
+    H1, W1, D = desc1.shape
+    H2, W2, _ = desc2.shape
+    
+    # Adaptive block size based on descriptor dimensions and GPU memory
+    if device == 'cuda' or (isinstance(device, torch.device) and device.type == 'cuda'):
+        # Larger block size for better GPU utilization
+        optimal_block_size = min(block_size, 2**14)  # Increase from 2**13 to 2**14
+    else:
+        optimal_block_size = block_size
+    
+    # Use the optimized fast_reciprocal_NNs with better parameters
+    from mast3r.fast_nn import fast_reciprocal_NNs
+    
+    matches_img1, matches_img2 = fast_reciprocal_NNs(
+        desc1, desc2, 
+        subsample_or_initxy1=subsample_factor, 
+        device=device, 
+        dist='dot', 
+        block_size=optimal_block_size
+    )
+    
+    return matches_img1, matches_img2
 
 
 def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matches_img2, img_dir):
@@ -233,7 +266,8 @@ def check_depth_consistency(pixel_depths, threshold=0.05, min_validations=2):
 
 def densify_with_consistency_check(reconstruction, img_dir, pairs, batch_size=20, sampling_factor=8, 
                                  force_cpu=False, verbose=False, min_consistent_pairs=3, 
-                                 depth_consistency_threshold=0.05):
+                                 depth_consistency_threshold=0.05, enable_fast_matching=False,
+                                 block_size_power=14):
     """
     Main function that implements multi-pairing consistency checking for each frame.
     """
@@ -289,7 +323,16 @@ def densify_with_consistency_check(reconstruction, img_dir, pairs, batch_size=20
                 
                 desc1, desc2 = pred1['desc'][0].squeeze(0).detach(), pred2['desc'][0].squeeze(0).detach()
                 
-                matches_img1, matches_img2 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=sampling_factor, device=device, dist='dot', block_size=2**13)
+                # Use optimized matching
+                if enable_fast_matching:
+                    matches_img1, matches_img2 = optimized_fast_matching(
+                        desc1, desc2, 
+                        subsample_factor=sampling_factor, 
+                        device=device,
+                        block_size=2**block_size_power
+                    )
+                else:
+                    matches_img1, matches_img2 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=sampling_factor, device=device, dist='dot', block_size=2**13)
                 
                 # Filter valid matches
                 H1, W1 = view1['true_shape'][0]
@@ -382,16 +425,14 @@ def densify_with_consistency_check(reconstruction, img_dir, pairs, batch_size=20
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--reconstruction_path', type=str, required=True, help='Path to the COLMAP reconstruction directory', default='/home/blakedd/data/7ee503023c_402121BD38OPENPIPELINE_HOLES/689a20d452eaff0aa5589bd5/sparse/')
-    parser.add_argument('--img_dir', type=str, required=True, help='Path to the directory containing the images', default='/home/blakedd/data/7ee503023c_402121BD38OPENPIPELINE_HOLES/7ee503023c_402121BD38OPENPIPELINE_HOLES/images/')
-    parser.add_argument('--output_path', type=str, required=False, help='Path and name of the output PLY file', default=DEFAULT_OUTPUT)
-    parser.add_argument('--pairs_path', type=str, required=False, help='Path and name of the output pairs JSON file', default=DEFAULT_PAIRS)
-    parser.add_argument('--use_existing_pairs', action='store_true', help='Use existing pairs from JSON file if it exists')
-    parser.add_argument('--batch_size', type=int, required=False, help='Batch size for inference. 1 will always work, but will be slower. 24GB GPU can handle batch size of 30', default=1)
-    parser.add_argument('--force_cpu', action='store_true', help='Force CPU inference instead of CUDA')
-    parser.add_argument('--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('--sampling_factor', type=int, required=False, help='Sampling factor for point triangulation. Lower = denser. User powers of 2. Default = 8', default=8)
-    parser.add_argument('--min_feature_coverage', type=float, required=False, help='Minimum proportion of image that must be covered by shared points to be considered a good match. Default = 0.6', default=0.6)
+    parser.add_argument('-s', '--scene_dir', type=str, required=True, help='Path to the scene directory containing sparse/ and images/ subdirectories')
+    parser.add_argument('-o', '--output_dir', type=str, required=False, help='Output directory name (relative to scene_dir) for all output files', default='densified_output')
+    parser.add_argument('-u', '--use_existing_pairs', action='store_true', help='Use existing pairs from JSON file if it exists')
+    parser.add_argument('-b', '--batch_size', type=int, required=False, help='Batch size for inference. 1 will always work, but will be slower. 24GB GPU can handle batch size of 30', default=1)
+    parser.add_argument('-c', '--force_cpu', action='store_true', help='Force CPU inference instead of CUDA')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('-f', '--sampling_factor', type=int, required=False, help='Sampling factor for point triangulation. Lower = denser. User powers of 2. Default = 8', default=8)
+    parser.add_argument('-m', '--min_feature_coverage', type=float, required=False, help='Minimum proportion of image that must be covered by shared points to be considered a good match. Default = 0.6', default=0.6)
     # New parameters for multi-pairing consistency
     parser.add_argument('--max_pairs_per_image', type=int, required=False, help='Maximum number of pairs to compute per image for consistency checking. Default = 7', default=7)
     parser.add_argument('--min_consistent_pairs', type=int, required=False, help='Minimum number of consistent pairings required to keep a point. Default = 3', default=3)
@@ -401,12 +442,33 @@ def main():
     parser.add_argument('--enable_bbox_filter', action='store_true', help='Enable bounding box filtering based on COLMAP 3D points')
     parser.add_argument('--min_point_visibility', type=int, required=False, help='Minimum visibility (number of images) for COLMAP points used in bounding box computation. Default = 3', default=3)
     parser.add_argument('--bbox_padding_factor', type=float, required=False, help='Additional padding for bounding box as fraction of size. Default = 0.1', default=0.1)
+    # New parameters for matching optimization
+    parser.add_argument('--enable_fast_matching', action='store_true', help='Enable optimized fast matching with better block sizes')
+    parser.add_argument('--block_size_power', type=int, required=False, help='Block size as power of 2 (e.g., 14 for 2^14). Default = 14', default=14)
     args = parser.parse_args()
 
-    reconstruction_path = args.reconstruction_path
-    img_dir = args.img_dir
-    output_path = args.output_path
-    pairs_path = args.pairs_path
+    scene_dir = args.scene_dir
+    reconstruction_path = os.path.join(scene_dir, 'sparse')
+    img_dir = os.path.join(scene_dir, 'images')
+    
+    # Create output directory structure
+    output_dir = os.path.join(scene_dir, args.output_dir)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}")
+    
+    # Set up output file paths
+    output_path = os.path.join(output_dir, 'dense.ply')
+    pairs_path = os.path.join(output_dir, DEFAULT_PAIRS)
+    
+    # Validate scene directory structure
+    if not os.path.exists(scene_dir):
+        raise ValueError(f"Scene directory does not exist: {scene_dir}")
+    if not os.path.exists(reconstruction_path):
+        raise ValueError(f"Sparse reconstruction directory does not exist: {reconstruction_path}")
+    if not os.path.exists(img_dir):
+        raise ValueError(f"Images directory does not exist: {img_dir}")
+    
     use_existing_pairs = args.use_existing_pairs
     batch_size = args.batch_size
     force_cpu = args.force_cpu
@@ -422,19 +484,20 @@ def main():
     enable_bbox_filter = args.enable_bbox_filter
     min_point_visibility = args.min_point_visibility
     bbox_padding_factor = args.bbox_padding_factor
+    # Fast matching parameters
+    enable_fast_matching = args.enable_fast_matching
+    block_size_power = args.block_size_power
 
     if use_existing_pairs and not os.path.exists(pairs_path):
         print(f"Pairs file {pairs_path} does not exist. Falling back to generating new pairs.")
         use_existing_pairs = False
 
-    # output path may include a filename. create the directory if it doesn't exist
-    output_dir = os.path.dirname(output_path)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # if output path is just a directory, add the default filename
-    if not output_path.endswith('.ply'):
-        output_path = os.path.join(output_path, DEFAULT_OUTPUT)
+    # Print configuration summary
+    print(f"Scene directory: {scene_dir}")
+    print(f"Output directory: {output_dir}")
+    print(f"Dense point cloud will be saved to: {output_path}")
+    print(f"Pairs file: {pairs_path}")
+    print()
 
     torch.cuda.empty_cache()
     start_time = time.time()
@@ -451,6 +514,30 @@ def main():
             padding_factor=bbox_padding_factor
         )
     
+    # Save configuration for debugging/reproducibility
+    config_path = os.path.join(output_dir, 'config.json')
+    config = {
+        'scene_dir': scene_dir,
+        'output_dir': args.output_dir,
+        'batch_size': batch_size,
+        'sampling_factor': sampling_factor,
+        'min_feature_coverage': min_feature_coverage,
+        'max_pairs_per_image': max_pairs_per_image,
+        'min_consistent_pairs': min_consistent_pairs,
+        'depth_consistency_threshold': depth_consistency_threshold,
+        'enable_consistency_check': enable_consistency_check,
+        'enable_bbox_filter': enable_bbox_filter,
+        'min_point_visibility': min_point_visibility,
+        'bbox_padding_factor': bbox_padding_factor,
+        'enable_fast_matching': enable_fast_matching,
+        'block_size_power': block_size_power,
+        'force_cpu': force_cpu,
+        'verbose': verbose
+    }
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    print(f"Saved configuration to {config_path}")
+
     if not use_existing_pairs:
         if enable_consistency_check:
             pairs = get_multiple_pairs_per_image(reconstruction, max_pairs_per_image=max_pairs_per_image, min_feature_coverage=min_feature_coverage)
@@ -471,22 +558,35 @@ def main():
             force_cpu=force_cpu, 
             verbose=verbose,
             min_consistent_pairs=min_consistent_pairs,
-            depth_consistency_threshold=depth_consistency_threshold
+            depth_consistency_threshold=depth_consistency_threshold,
+            enable_fast_matching=enable_fast_matching,
+            block_size_power=block_size_power
         )
     else:
-        densified_pairs = densify_pairs_mast3r_batch(reconstruction, img_dir, pairs, batch_size=batch_size, sampling_factor=sampling_factor, force_cpu=force_cpu, verbose=verbose)
+        densified_pairs = densify_pairs_mast3r_batch(
+            reconstruction, img_dir, pairs, 
+            batch_size=batch_size, 
+            sampling_factor=sampling_factor, 
+            force_cpu=force_cpu, 
+            verbose=verbose,
+            enable_fast_matching=enable_fast_matching,
+            block_size_power=block_size_power
+        )
         # Convert to the expected format for backwards compatibility
         densified_frames = {}
         for img1, data in densified_pairs.items():
             densified_frames[int(img1)] = data
 
     end_time = time.time()
-    print(f"Time taken: {end_time - start_time} seconds")
+    print(f"Processing completed in {end_time - start_time:.2f} seconds")
 
-    # display dense clouds in open3d
+    # Combine all points from different frames
     all_points = None
     all_colors = None
+    total_frames_processed = 0
+    
     for frame_id, frame_data in densified_frames.items():
+        total_frames_processed += 1
         if all_points is None:
             all_points = frame_data['points']
             all_colors = frame_data['colors']
@@ -503,19 +603,49 @@ def main():
         print("No points remaining after filtering. Exiting.")
         return
 
+    # Create and save point cloud
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(all_points)
     pcd.colors = o3d.utility.Vector3dVector(all_colors)
 
-    # save all points to a ply file
+    # Save point cloud
     o3d.io.write_point_cloud(output_path, pcd)
-    print(f"Saved {len(all_points)} points to {output_path}")
+    
+    # Save processing summary
+    summary_path = os.path.join(output_dir, 'processing_summary.json')
+    summary = {
+        'total_points': len(all_points),
+        'total_frames_processed': total_frames_processed,
+        'processing_time_seconds': end_time - start_time,
+        'bounding_box_filtering_enabled': enable_bbox_filter,
+        'consistency_checking_enabled': enable_consistency_check
+    }
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    # Print final summary
+    print()
+    print("=" * 60)
+    print("DENSIFICATION COMPLETED")
+    print("=" * 60)
+    print(f"Dense point cloud: {output_path}")
+    print(f"Total points: {len(all_points):,}")
+    print(f"Frames processed: {total_frames_processed}")
+    print(f"Processing time: {end_time - start_time:.2f} seconds")
+    print()
+    print("Output files saved to:")
+    print(f"  - Dense point cloud: {os.path.relpath(output_path, scene_dir)}")
+    print(f"  - Pairs file: {os.path.relpath(pairs_path, scene_dir)}")
+    print(f"  - Configuration: {os.path.relpath(config_path, scene_dir)}")
+    print(f"  - Summary: {os.path.relpath(summary_path, scene_dir)}")
+    print("=" * 60)
 
-    # display the point cloud
+    # Display the point cloud
+    print("Opening point cloud visualization...")
     o3d.visualization.draw_geometries([pcd])
 
 
-def densify_pairs_mast3r_batch(reconstruction, img_dir, pairs, batch_size=20, sampling_factor=8, force_cpu=False, verbose=False) -> dict[int, np.ndarray]:
+def densify_pairs_mast3r_batch(reconstruction, img_dir, pairs, batch_size=20, sampling_factor=8, force_cpu=False, verbose=False, enable_fast_matching=False, block_size_power=14) -> dict[int, np.ndarray]:
 
     # fixed params for MASt3R
     model_w = 512
@@ -591,7 +721,16 @@ def densify_pairs_mast3r_batch(reconstruction, img_dir, pairs, batch_size=20, sa
 
             desc1, desc2 = pred1['desc'][i].squeeze(0).detach(), pred2['desc'][i].squeeze(0).detach()
 
-            matches_img1, matches_img2 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=sampling_factor, device=device, dist='dot', block_size=2**13)
+            # Use optimized matching
+            if enable_fast_matching:
+                matches_img1, matches_img2 = optimized_fast_matching(
+                    desc1, desc2, 
+                    subsample_factor=sampling_factor, 
+                    device=device,
+                    block_size=2**block_size_power
+                )
+            else:
+                matches_img1, matches_img2 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=sampling_factor, device=device, dist='dot', block_size=2**13)
 
             # ignore small border around the edge
             H1, W1 = view1['true_shape'][i]

@@ -97,7 +97,7 @@ class ColmapReconstruction:
         
         for point_id in random.sample(list(shared_points), sample_size):
             point = self.reconstruction.points3D[point_id]
-            parallax_angle = compute_parallax_angle(point.xyz, img1_id, img2_id, self.reconstruction)
+            parallax_angle = compute_parallax_angle(point.xyz, img1_id, img2_id, self)
             parallax_angles.append(parallax_angle)
         
         return np.mean(parallax_angles)
@@ -400,90 +400,59 @@ class ColmapReconstruction:
     def get_num_images(self) -> int:
         """Get total number of images."""
         return len(self.reconstruction.images)
-
-
-def compute_robust_bounding_box(reconstruction, min_visibility=3, padding_factor=0.1):
-    """
-    Backward compatibility wrapper for compute_robust_bounding_box.
-    For new code, use ColmapReconstruction.compute_robust_bounding_box() instead.
-    """
-    if isinstance(reconstruction, ColmapReconstruction):
-        return reconstruction.compute_robust_bounding_box(min_visibility, padding_factor)
-    else:
-        # Create temporary wrapper for backward compatibility
-        wrapper = ColmapReconstruction(reconstruction)
-        return wrapper.compute_robust_bounding_box(min_visibility, padding_factor)
-
-
-def get_camera_calibration_matrix(image, reconstruction):
-    """Get camera calibration matrix for an image."""
-    if isinstance(reconstruction, ColmapReconstruction):
-        return reconstruction.get_image_camera(image.image_id).calibration_matrix()
-    else:
-        return reconstruction.images[image.image_id].camera.calibration_matrix()
-
-
-def get_camera_projection_matrix(image_id, reconstruction):
-    """Get camera projection matrix (K @ [R|t])."""
-    if isinstance(reconstruction, ColmapReconstruction):
-        camera = reconstruction.get_image_camera(image_id)
+    
+    def get_camera_projection_matrix(self, image_id: int) -> np.ndarray:
+        """Get camera projection matrix (K @ [R|t])."""
+        camera = self.get_image_camera(image_id)
         K = camera.calibration_matrix()
-        cam_from_world = reconstruction.get_image_cam_from_world(image_id)
+        cam_from_world = self.get_image_cam_from_world(image_id)
         return K @ cam_from_world.matrix()
-    else:
-        image = reconstruction.images[image_id]
-        K = image.camera.calibration_matrix()
-        return K @ image.cam_from_world().matrix()
-
-
-def get_camera_distortion_params(image_id, reconstruction):
-    """Extract camera distortion parameters as a dictionary and array."""
-    if isinstance(reconstruction, ColmapReconstruction):
-        camera = reconstruction.get_image_camera(image_id)
-    else:
-        image = reconstruction.images[image_id]
-        camera = image.camera
     
-    # Parse parameter info
-    dist_keys = camera.params_info.split(', ')
-    dist_dict = {}
-    for i, key in enumerate(dist_keys):
-        dist_dict[key] = camera.params[i]
+    def get_camera_center(self, image_id: int) -> np.ndarray:
+        """Get camera center in world coordinates."""
+        cam = self.get_image_cam_from_world(image_id)
+        R = cam.rotation.matrix()
+        t = cam.translation
+        return -R.T @ t
     
-    # Create standard distortion coefficient array
-    dist_coeffs = np.array([
-        dist_dict.get('k1', 0), dist_dict.get('k2', 0), 
-        dist_dict.get('p1', 0), dist_dict.get('p2', 0), 
-        dist_dict.get('k3', 0), dist_dict.get('k4', 0), 
-        dist_dict.get('k5', 0), dist_dict.get('k6', 0)
-    ])
+    def compute_baseline(self, img1_id: int, img2_id: int) -> float:
+        """Compute baseline distance between two cameras."""
+        C1 = self.get_camera_center(img1_id)
+        C2 = self.get_camera_center(img2_id)
+        return np.linalg.norm(C1 - C2)
     
-    return dist_dict, dist_coeffs
+    def get_camera_calibration_matrix(self, image_id: int) -> np.ndarray:
+        """Get camera calibration matrix K for an image."""
+        return self.get_image_camera(image_id).calibration_matrix()
+    
+    def get_camera_distortion_params(self, image_id: int):
+        """Extract camera distortion parameters as a dictionary and array."""
+        camera = self.get_image_camera(image_id)
+        
+        # Parse parameter info
+        dist_keys = camera.params_info.split(', ')
+        dist_dict = {}
+        for i, key in enumerate(dist_keys):
+            dist_dict[key] = camera.params[i]
+        
+        # Create standard distortion coefficient array
+        dist_coeffs = np.array([
+            dist_dict.get('k1', 0), dist_dict.get('k2', 0), 
+            dist_dict.get('p1', 0), dist_dict.get('p2', 0), 
+            dist_dict.get('k3', 0), dist_dict.get('k4', 0), 
+            dist_dict.get('k5', 0), dist_dict.get('k6', 0)
+        ])
+        
+        return dist_dict, dist_coeffs
 
 
-def get_camera_center(image_id, reconstruction):
-    """Get camera center in world coordinates."""
-    if isinstance(reconstruction, ColmapReconstruction):
-        cam = reconstruction.get_image_cam_from_world(image_id)
-    else:
-        image = reconstruction.images[image_id]
-        cam = image.cam_from_world()
-    R = cam.rotation.matrix()
-    t = cam.translation
-    return -R.T @ t
 
 
-def compute_baseline(img1_id, img2_id, reconstruction):
-    """Compute baseline distance between two cameras."""
-    C1 = get_camera_center(img1_id, reconstruction)
-    C2 = get_camera_center(img2_id, reconstruction)
-    return np.linalg.norm(C1 - C2)
 
-
-def compute_parallax_angle(point_3d, img1_id, img2_id, reconstruction):
+def compute_parallax_angle(point_3d, img1_id, img2_id, reconstruction: ColmapReconstruction):
     """Compute parallax angle for a 3D point viewed from two cameras."""
-    C1 = get_camera_center(img1_id, reconstruction)
-    C2 = get_camera_center(img2_id, reconstruction)
+    C1 = reconstruction.get_camera_center(img1_id)
+    C2 = reconstruction.get_camera_center(img2_id)
     
     u = C1 - point_3d
     v = C2 - point_3d
@@ -503,75 +472,11 @@ class MatchCandidate:
         self.y_coverage = 0
 
 
-def get_multiple_pairs_per_image(reconstruction, max_pairs_per_image=7, min_points=100, 
-                                parallax_sample_size=100, min_feature_coverage=0.6):
-    """
-    Backward compatibility wrapper for get_multiple_pairs_per_image.
-    For new code, use ColmapReconstruction.get_multiple_pairs_per_image() instead.
-    """
-    if isinstance(reconstruction, ColmapReconstruction):
-        return reconstruction.get_multiple_pairs_per_image(max_pairs_per_image, min_points, 
-                                                         parallax_sample_size, min_feature_coverage)
-    else:
-        # Create temporary wrapper for backward compatibility
-        wrapper = ColmapReconstruction(reconstruction)
-        return wrapper.get_multiple_pairs_per_image(max_pairs_per_image, min_points, 
-                                                   parallax_sample_size, min_feature_coverage)
-
-
-def get_best_pairs(reconstruction, min_points=100, parallax_sample_size=100, min_feature_coverage=0.6):
-    """
-    Backward compatibility wrapper for get_best_pairs.
-    For new code, use ColmapReconstruction.get_best_pairs() instead.
-    """
-    if isinstance(reconstruction, ColmapReconstruction):
-        return reconstruction.get_best_pairs(min_points, parallax_sample_size, min_feature_coverage)
-    else:
-        # Create temporary wrapper for backward compatibility
-        wrapper = ColmapReconstruction(reconstruction)
-        return wrapper.get_best_pairs(min_points, parallax_sample_size, min_feature_coverage)
-
-
-def get_best_pair_for_image(reconstruction, target_image_id, min_points=100, parallax_sample_size=100, min_feature_coverage=0.6):
-    """
-    Backward compatibility wrapper for get_best_pair_for_image.
-    For new code, use ColmapReconstruction.get_best_pair_for_image() instead.
-    """
-    if isinstance(reconstruction, ColmapReconstruction):
-        return reconstruction.get_best_pair_for_image(target_image_id, min_points, parallax_sample_size, min_feature_coverage)
-    else:
-        # Create temporary wrapper for backward compatibility
-        wrapper = ColmapReconstruction(reconstruction)
-        return wrapper.get_best_pair_for_image(target_image_id, min_points, parallax_sample_size, min_feature_coverage)
-
-
 def load_reconstruction(reconstruction_path):
     """
     Load COLMAP reconstruction and return ColmapReconstruction wrapper.
-    For backward compatibility, can also return raw pycolmap.Reconstruction.
     """
     try:
         return ColmapReconstruction(reconstruction_path)
     except Exception as e:
-        raise ValueError(f"Failed to load COLMAP reconstruction from {reconstruction_path}: {e}")
-
-
-def validate_image_in_reconstruction(image_id, reconstruction):
-    """Check if an image ID exists in the reconstruction."""
-    if isinstance(reconstruction, ColmapReconstruction):
-        return reconstruction.has_image(image_id)
-    else:
-        return image_id in reconstruction.images
-
-
-def get_reconstruction_summary(reconstruction):
-    """
-    Get summary statistics about the reconstruction.
-    For new code, use ColmapReconstruction.get_summary() instead.
-    """
-    if isinstance(reconstruction, ColmapReconstruction):
-        return reconstruction.get_summary()
-    else:
-        # Create temporary wrapper for backward compatibility
-        wrapper = ColmapReconstruction(reconstruction)
-        return wrapper.get_summary() 
+        raise ValueError(f"Failed to load COLMAP reconstruction from {reconstruction_path}: {e}") 

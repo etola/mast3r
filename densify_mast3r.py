@@ -21,6 +21,7 @@ from dust3r.utils.image import load_images
 from dust3r.inference import inference
 
 import colmap_utils
+from colmap_utils import ColmapReconstruction
 from config import DensificationConfig, create_config_from_args
 
 def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
@@ -51,15 +52,15 @@ def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
 
 
 
-def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matches_img2):
+def compute_depth_from_pair(reconstruction: ColmapReconstruction, img1_id: int, img2_id: int, matches_img1: np.ndarray, matches_img2: np.ndarray):
     """
     Compute depth values for matches in the reference frame (img1) from a pair.
     Returns depths and 3D points in world coordinates.
     Assumes undistorted images.
     """
     # Get camera matrices
-    P1 = colmap_utils.get_camera_projection_matrix(img1_id, reconstruction)
-    P2 = colmap_utils.get_camera_projection_matrix(img2_id, reconstruction)
+    P1 = reconstruction.get_camera_projection_matrix(img1_id)
+    P2 = reconstruction.get_camera_projection_matrix(img2_id)
 
     # Convert matches to homogeneous coordinates for triangulation
     m1 = matches_img1.astype(np.float64).T
@@ -146,7 +147,7 @@ def check_depth_consistency(pixel_depths, threshold=0.05, min_validations=2):
         return None, False, 0
 
 
-def densify_with_consistency_check(reconstruction, pairs, config: DensificationConfig):
+def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: dict, config: DensificationConfig):
     """
     Main function that implements multi-pairing consistency checking for each frame.
     """
@@ -358,7 +359,7 @@ def main():
     start_time = time.time()
 
     print(f"Loading reconstruction from {config.reconstruction_path}...")
-    reconstruction = colmap_utils.load_reconstruction(config.reconstruction_path)
+    reconstruction: ColmapReconstruction = colmap_utils.load_reconstruction(config.reconstruction_path)
     
     # Compute robust bounding box if filtering is enabled
     bbox_min, bbox_max = None, None
@@ -465,7 +466,7 @@ def main():
     o3d.visualization.draw_geometries([pcd])
 
 
-def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfig) -> dict[int, np.ndarray]:
+def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict, config: DensificationConfig) -> dict[int, np.ndarray]:
 
     device = config.get_device()
     
@@ -599,10 +600,10 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
             img2_t = img2_cam.translation
 
             # Get camera centers using helper functions
-            img1_C = colmap_utils.get_camera_center(img1, reconstruction)
-            img2_C = colmap_utils.get_camera_center(img2, reconstruction)
-
-            baseline = colmap_utils.compute_baseline(img1, img2, reconstruction)
+            img1_C = reconstruction.get_camera_center(img1)
+            img2_C = reconstruction.get_camera_center(img2)
+            
+            baseline = reconstruction.compute_baseline(img1, img2)
 
             # filter out points that are too far from the cameras (parallax stand-in)
             dist_to_cameras = np.linalg.norm(triangulated_points - img1_C, axis=1)

@@ -554,16 +554,14 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
 
             # get colors from image 1
             img1_path = os.path.join(config.img_dir, reconstruction.images[int(img1)].name)
-            img1_color = np.zeros((len(matches_img1), 3))
             image = Image.open(img1_path)
             img_width, img_height = image.size  # Get actual image dimensions
             
-            for j in range(len(matches_img1)):
-                x, y = matches_img1[j]
-                # Convert to integers and clamp to image bounds
-                x = int(np.clip(x, 0, img_width - 1))
-                y = int(np.clip(y, 0, img_height - 1))
-                img1_color[j] = np.array(image.getpixel((x, y)), dtype=np.float32) / 255.0
+            # Vectorized color extraction
+            img_array = np.array(image, dtype=np.float32) / 255.0
+            x_coords = np.clip(matches_img1[:, 0].astype(int), 0, img_width - 1)
+            y_coords = np.clip(matches_img1[:, 1].astype(int), 0, img_height - 1)
+            img1_color = img_array[y_coords, x_coords]  # Note: numpy uses [y, x] indexing
 
             # Get camera matrices using helper functions
             K1 = reconstruction.images[int(img1)].camera.calibration_matrix()

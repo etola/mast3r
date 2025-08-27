@@ -375,13 +375,10 @@ def main():
     print(f"Saved configuration to {config_path}")
 
     if not config.use_existing_pairs:
-        if config.enable_consistency_check:
-            pairs = reconstruction.get_multiple_pairs_per_image(
-                max_pairs_per_image=config.max_pairs_per_image, 
-                min_feature_coverage=config.min_feature_coverage
-            )
-        else:
-            pairs = reconstruction.get_best_pairs(min_feature_coverage=config.min_feature_coverage)
+        pairs = reconstruction.get_best_pairs(
+            min_feature_coverage=config.min_feature_coverage,
+            pairs_per_image=config.max_pairs_per_image
+        )
         with open(config.pairs_path, 'w') as f:
             print(f"Saving pairs to {config.pairs_path}...")
             json.dump(pairs, f, indent=4)

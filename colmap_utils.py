@@ -169,80 +169,16 @@ class ColmapReconstruction:
         
         return good_parallax_candidates
     
-    def get_multiple_pairs_per_image(self, max_pairs_per_image: int = 7, min_points: int = 100, 
-                                   parallax_sample_size: int = 100, min_feature_coverage: float = 0.6) -> Dict[int, List[int]]:
+    def get_best_pairs(self, min_points: int = 100, parallax_sample_size: int = 100, min_feature_coverage: float = 0.6, pairs_per_image: int = 1) -> Dict[int, List[int]]:
         """
-        Find multiple pairs for each image instead of just one best pair.
+        Find the best matching image pairs for densification.
         Returns a dictionary where each key is an image_id and value is a list of partner image_ids.
         """
-        # Initialize empty pair map (image ids to list of partner ids)
-        pairs = {}
-        for image in self.reconstruction.images.values():
-            pairs[image.image_id] = []
-        
-        self._ensure_image_point_maps()
-        
-        # Process each image
-        for i, image in enumerate(self.reconstruction.images.values()):
-            print(f"Getting multiple corresponding images for {image.name}... {i}/{len(self.reconstruction.images) - 1}")
-            
-            # Find other images that share at least min_points points
-            other_images = [other_image for other_image in self.reconstruction.images.values() 
-                           if other_image.image_id != image.image_id]
-            match_candidates = []
-            
-            for other_image in other_images:
-                if other_image.image_id not in self._image_point3D_ids:
-                    continue
-                # Get the points that the two images share
-                shared_points = self._image_point3D_ids[image.image_id] & self._image_point3D_ids[other_image.image_id]
-                if len(shared_points) >= min_points:
-                    match_candidates.append(MatchCandidate(other_image.image_id, shared_points))
-            
-            # Skip if no good candidates found
-            if len(match_candidates) == 0:
-                continue
-            
-            # Compute feature coverage for each candidate
-            for match_candidate in match_candidates:
-                x_cov, y_cov = self.compute_feature_coverage(match_candidate.shared_points, image.image_id)
-                match_candidate.x_coverage = x_cov
-                match_candidate.y_coverage = y_cov
-            
-            # Compute average parallax angle for each candidate
-            for match_candidate in match_candidates:
-                match_candidate.avg_parallax_angle = self.compute_average_parallax(
-                    match_candidate.shared_points, image.image_id, match_candidate.image_id, 
-                    parallax_sample_size)
-            
-            # Sort candidates by a combination of shared points, feature coverage, and parallax
-            match_candidates.sort(key=lambda x: (
-                len(x.shared_points) * 
-                ((x.x_coverage + x.y_coverage) / 2) * 
-                min(x.avg_parallax_angle, 1.0)  # Cap parallax contribution
-            ), reverse=True)
-            
-            # Select top candidates with good parallax (> 0.1 radians ≈ 5.7 degrees)
-            good_candidates = []
-            for candidate in match_candidates:
-                if candidate.avg_parallax_angle > 0.1 and len(good_candidates) < max_pairs_per_image:
-                    good_candidates.append(candidate.image_id)
-            
-            # If no good parallax candidates, just take the top ones by shared points
-            if len(good_candidates) == 0:
-                good_candidates = [candidate.image_id for candidate in match_candidates[:max_pairs_per_image]]
-            
-            pairs[image.image_id] = good_candidates
-
-        return pairs
-    
-    def get_best_pairs(self, min_points: int = 100, parallax_sample_size: int = 100, min_feature_coverage: float = 0.6) -> Dict[int, int]:
-        """Original single-pair selection function"""
         
         # Initialize empty pair map (image ids)
         pairs = {}
         for image in self.reconstruction.images.values():
-            pairs[image.image_id] = -1
+            pairs[image.image_id] = []
         
         self._ensure_image_point_maps()
         
@@ -257,8 +193,9 @@ class ColmapReconstruction:
                 parallax_sample_size=parallax_sample_size
             )
             
-            # Use the first (best) partner to maintain original behavior
-            pairs[image.image_id] = best_partner_ids[0]
+            # Filter out -1 (no match found) and take up to pairs_per_image partners
+            valid_partners = [pid for pid in best_partner_ids if pid != -1]
+            pairs[image.image_id] = valid_partners[:pairs_per_image]
 
         return pairs
     

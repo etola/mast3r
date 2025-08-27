@@ -55,25 +55,17 @@ def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matc
     """
     Compute depth values for matches in the reference frame (img1) from a pair.
     Returns depths and 3D points in world coordinates.
+    Assumes undistorted images.
     """
-    # Get camera matrices using helper functions
-    K1 = reconstruction.images[img1_id].camera.calibration_matrix()
-    K2 = reconstruction.images[img2_id].camera.calibration_matrix()
+    # Get camera matrices
     P1 = colmap_utils.get_camera_projection_matrix(img1_id, reconstruction)
     P2 = colmap_utils.get_camera_projection_matrix(img2_id, reconstruction)
 
-    m1_undistort = matches_img1.astype(np.float64).T
-    m2_undistort = matches_img2.astype(np.float64).T
+    # Convert matches to homogeneous coordinates for triangulation
+    m1 = matches_img1.astype(np.float64).T
+    m2 = matches_img2.astype(np.float64).T
 
-    # Get distortion parameters using helper functions
-    _, dist_coeffs_1 = colmap_utils.get_camera_distortion_params(img1_id, reconstruction)
-    _, dist_coeffs_2 = colmap_utils.get_camera_distortion_params(img2_id, reconstruction)
-
-    # undistort the matches
-    m1_undistort = cv2.undistortPoints(m1_undistort, K1, dist_coeffs_1, P=K1)
-    m2_undistort = cv2.undistortPoints(m2_undistort, K2, dist_coeffs_2, P=K2)
-
-    triangulated_points = cv2.triangulatePoints(P1, P2, m1_undistort, m2_undistort)
+    triangulated_points = cv2.triangulatePoints(P1, P2, m1, m2)
     triangulated_points = triangulated_points / triangulated_points[3, :]
     triangulated_points = triangulated_points[:3, :]
     triangulated_points = triangulated_points.transpose()
@@ -563,24 +555,15 @@ def densify_pairs_mast3r_batch(reconstruction, pairs, config: DensificationConfi
             y_coords = np.clip(matches_img1[:, 1].astype(int), 0, img_height - 1)
             img1_color = img_array[y_coords, x_coords]  # Note: numpy uses [y, x] indexing
 
-            # Get camera matrices using helper functions
-            K1 = reconstruction.images[int(img1)].camera.calibration_matrix()
-            K2 = reconstruction.images[int(img2)].camera.calibration_matrix()
+            # Get camera matrices (assuming undistorted images)
             P1 = colmap_utils.get_camera_projection_matrix(int(img1), reconstruction)
             P2 = colmap_utils.get_camera_projection_matrix(int(img2), reconstruction)
 
-            m1_undistort = matches_img1.astype(np.float64).T
-            m2_undistort = matches_img2.astype(np.float64).T
+            # Convert matches to homogeneous coordinates for triangulation
+            m1 = matches_img1.astype(np.float64).T
+            m2 = matches_img2.astype(np.float64).T
 
-            # Get distortion parameters using helper functions
-            _, dist_coeffs_1 = colmap_utils.get_camera_distortion_params(int(img1), reconstruction)
-            _, dist_coeffs_2 = colmap_utils.get_camera_distortion_params(int(img2), reconstruction)
-
-            # undistort the matches
-            m1_undistort = cv2.undistortPoints(m1_undistort, K1, dist_coeffs_1, P=K1)
-            m2_undistort = cv2.undistortPoints(m2_undistort, K2, dist_coeffs_2, P=K2)
-
-            triangulated_points = cv2.triangulatePoints(P1, P2, m1_undistort, m2_undistort)
+            triangulated_points = cv2.triangulatePoints(P1, P2, m1, m2)
             triangulated_points = triangulated_points / triangulated_points[3, :]
             triangulated_points = triangulated_points[:3, :]
             triangulated_points = triangulated_points.transpose()

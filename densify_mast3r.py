@@ -1,22 +1,3 @@
-'''
------------------------
-| Blake Troutman 2025 |
------------------------
-
-
-This script is a hackathon project to densify a COLMAP SFM reconstruction using MASt3R.
-
-It is designed to be a simple script that can be run on a single machine with a GPU.
-
-It is not designed to be a production-ready script.
-
-Since this script is a hackathon project, manage your expectations accordingly when parsing through the code.
-
-
-Any bad code you find here is the result of Cursor; all the good code is mine. 
-
-'''
-
 import os
 import sys
 import argparse
@@ -39,55 +20,10 @@ import mast3r.utils.path_to_dust3r
 from dust3r.utils.image import load_images
 from dust3r.inference import inference
 
+import colmap_utils
+
 NO_POINT = 18446744073709551615
 DEFAULT_PAIRS = 'pairs.json'
-
-def compute_robust_bounding_box(reconstruction, min_visibility=3, padding_factor=0.1):
-    """
-    Compute a robust bounding box from COLMAP 3D points with good visibility.
-    
-    Args:
-        reconstruction: COLMAP reconstruction object
-        min_visibility: Minimum number of images a point must be visible in
-        padding_factor: Additional padding as fraction of bounding box size
-    
-    Returns:
-        bbox_min, bbox_max: 3D coordinates of bounding box corners
-    """
-    robust_points = []
-    
-    # Collect 3D points with sufficient visibility
-    for point_id, point3D in reconstruction.points3D.items():
-        if len(point3D.track.elements) >= min_visibility:
-            robust_points.append(point3D.xyz)
-    
-    if len(robust_points) == 0:
-        print(f"Warning: No points found with visibility >= {min_visibility}")
-        # Fallback to all points
-        robust_points = [point3D.xyz for point3D in reconstruction.points3D.values()]
-    
-    if len(robust_points) == 0:
-        print("Warning: No 3D points found in reconstruction")
-        return None, None
-    
-    robust_points = np.array(robust_points)
-    
-    # Compute percentile-based bounding box to be robust to outliers
-    bbox_min = np.percentile(robust_points, 5, axis=0)   # 5th percentile
-    bbox_max = np.percentile(robust_points, 95, axis=0)  # 95th percentile
-    
-    # Add padding
-    bbox_size = bbox_max - bbox_min
-    padding = bbox_size * padding_factor
-    bbox_min -= padding
-    bbox_max += padding
-    
-    print(f"Computed robust bounding box from {len(robust_points)} points (min_visibility={min_visibility})")
-    print(f"  Min: [{bbox_min[0]:.3f}, {bbox_min[1]:.3f}, {bbox_min[2]:.3f}]")
-    print(f"  Max: [{bbox_max[0]:.3f}, {bbox_max[1]:.3f}, {bbox_max[2]:.3f}]")
-    print(f"  Size: [{bbox_size[0]:.3f}, {bbox_size[1]:.3f}, {bbox_size[2]:.3f}]")
-    
-    return bbox_min, bbox_max
 
 
 def filter_points_by_bounding_box(points, colors, bbox_min, bbox_max):
@@ -155,29 +91,18 @@ def compute_depth_from_pair(reconstruction, img1_id, img2_id, matches_img1, matc
     Compute depth values for matches in the reference frame (img1) from a pair.
     Returns depths and 3D points in world coordinates.
     """
-    # get triangulated points
+    # Get camera matrices using helper functions
     K1 = reconstruction.images[img1_id].camera.calibration_matrix()
     K2 = reconstruction.images[img2_id].camera.calibration_matrix()
-    P1 = K1 @ reconstruction.images[img1_id].cam_from_world().matrix()
-    P2 = K2 @ reconstruction.images[img2_id].cam_from_world().matrix()
+    P1 = colmap_utils.get_camera_projection_matrix(img1_id, reconstruction)
+    P2 = colmap_utils.get_camera_projection_matrix(img2_id, reconstruction)
 
     m1_undistort = matches_img1.astype(np.float64).T
     m2_undistort = matches_img2.astype(np.float64).T
 
-    # get distortion parameters
-    dist_keys_1 = reconstruction.images[img1_id].camera.params_info.split(', ')
-    dist_keys_2 = reconstruction.images[img2_id].camera.params_info.split(', ')
-    dist1 = {}
-    dist2 = {}
-    for j in range(len(dist_keys_1)):
-        dist1[dist_keys_1[j]] = reconstruction.images[img1_id].camera.params[j]
-    for j in range(len(dist_keys_2)):
-        dist2[dist_keys_2[j]] = reconstruction.images[img2_id].camera.params[j]
-
-    dist_coeffs_1 = np.array([dist1.get('k1', 0), dist1.get('k2', 0), dist1.get('p1', 0), dist1.get('p2', 0), 
-                             dist1.get('k3', 0), dist1.get('k4', 0), dist1.get('k5', 0), dist1.get('k6', 0)])
-    dist_coeffs_2 = np.array([dist2.get('k1', 0), dist2.get('k2', 0), dist2.get('p1', 0), dist2.get('p2', 0), 
-                             dist2.get('k3', 0), dist2.get('k4', 0), dist2.get('k5', 0), dist2.get('k6', 0)])
+    # Get distortion parameters using helper functions
+    _, dist_coeffs_1 = colmap_utils.get_camera_distortion_params(img1_id, reconstruction)
+    _, dist_coeffs_2 = colmap_utils.get_camera_distortion_params(img2_id, reconstruction)
 
     # undistort the matches
     m1_undistort = cv2.undistortPoints(m1_undistort, K1, dist_coeffs_1, P=K1)
@@ -503,12 +428,12 @@ def main():
     start_time = time.time()
 
     print(f"Loading reconstruction from {reconstruction_path}...")
-    reconstruction = pycolmap.Reconstruction(reconstruction_path)
+    reconstruction = colmap_utils.load_reconstruction(reconstruction_path)
     
     # Compute robust bounding box if filtering is enabled
     bbox_min, bbox_max = None, None
     if enable_bbox_filter:
-        bbox_min, bbox_max = compute_robust_bounding_box(
+        bbox_min, bbox_max = colmap_utils.compute_robust_bounding_box(
             reconstruction, 
             min_visibility=min_point_visibility, 
             padding_factor=bbox_padding_factor
@@ -540,9 +465,9 @@ def main():
 
     if not use_existing_pairs:
         if enable_consistency_check:
-            pairs = get_multiple_pairs_per_image(reconstruction, max_pairs_per_image=max_pairs_per_image, min_feature_coverage=min_feature_coverage)
+            pairs = colmap_utils.get_multiple_pairs_per_image(reconstruction, max_pairs_per_image=max_pairs_per_image, min_feature_coverage=min_feature_coverage)
         else:
-            pairs = get_best_pairs(reconstruction, min_feature_coverage=min_feature_coverage)
+            pairs = colmap_utils.get_best_pairs(reconstruction, min_feature_coverage=min_feature_coverage)
         with open(pairs_path, 'w') as f:
             print(f"Saving pairs to {pairs_path}...")
             json.dump(pairs, f, indent=4)
@@ -773,27 +698,18 @@ def densify_pairs_mast3r_batch(reconstruction, img_dir, pairs, batch_size=20, sa
                 y = int(np.clip(y, 0, img_height - 1))
                 img1_color[j] = np.array(image.getpixel((x, y)), dtype=np.float32) / 255.0
 
-            # get triangulated points
+            # Get camera matrices using helper functions
             K1 = reconstruction.images[int(img1)].camera.calibration_matrix()
             K2 = reconstruction.images[int(img2)].camera.calibration_matrix()
-            P1 = K1 @ reconstruction.images[int(img1)].cam_from_world().matrix()
-            P2 = K2 @ reconstruction.images[int(img2)].cam_from_world().matrix()
+            P1 = colmap_utils.get_camera_projection_matrix(int(img1), reconstruction)
+            P2 = colmap_utils.get_camera_projection_matrix(int(img2), reconstruction)
 
             m1_undistort = matches_img1.astype(np.float64).T
             m2_undistort = matches_img2.astype(np.float64).T
 
-            # get distortion parameters
-            dist_keys_1 = reconstruction.images[int(img1)].camera.params_info.split(', ')
-            dist_keys_2 = reconstruction.images[int(img2)].camera.params_info.split(', ')
-            dist1 = {}
-            dist2 = {}
-            for j in range(len(dist_keys_1)):
-                dist1[dist_keys_1[j]] = reconstruction.images[int(img1)].camera.params[j]
-            for j in range(len(dist_keys_2)):
-                dist2[dist_keys_2[j]] = reconstruction.images[int(img2)].camera.params[j]
-
-            dist_coeffs_1 = np.array([dist1.get('k1', 0), dist1.get('k2', 0), dist1.get('p1', 0), dist1.get('p2', 0), dist1.get('k3', 0), dist1.get('k4', 0), dist1.get('k5', 0), dist1.get('k6', 0)])
-            dist_coeffs_2 = np.array([dist2.get('k1', 0), dist2.get('k2', 0), dist2.get('p1', 0), dist2.get('p2', 0), dist2.get('k3', 0), dist2.get('k4', 0), dist2.get('k5', 0), dist2.get('k6', 0)])
+            # Get distortion parameters using helper functions
+            _, dist_coeffs_1 = colmap_utils.get_camera_distortion_params(int(img1), reconstruction)
+            _, dist_coeffs_2 = colmap_utils.get_camera_distortion_params(int(img2), reconstruction)
 
             # undistort the matches
             m1_undistort = cv2.undistortPoints(m1_undistort, K1, dist_coeffs_1, P=K1)
@@ -813,13 +729,11 @@ def densify_pairs_mast3r_batch(reconstruction, img_dir, pairs, batch_size=20, sa
             img2_R = img2_cam.rotation.matrix()
             img2_t = img2_cam.translation
 
-            # image center of img1
-            img1_C = -img1_R.T @ img1_t
+            # Get camera centers using helper functions
+            img1_C = colmap_utils.get_camera_center(int(img1), reconstruction)
+            img2_C = colmap_utils.get_camera_center(int(img2), reconstruction)
 
-            # image center of img2
-            img2_C = -img2_R.T @ img2_t
-
-            baseline = np.linalg.norm(img1_C - img2_C)
+            baseline = colmap_utils.compute_baseline(int(img1), int(img2), reconstruction)
 
             # filter out points that are too far from the cameras (parallax stand-in)
             dist_to_cameras = np.linalg.norm(triangulated_points - img1_C, axis=1)
@@ -854,216 +768,7 @@ def densify_pairs_mast3r_batch(reconstruction, img_dir, pairs, batch_size=20, sa
     return densified_pairs
 
 
-def get_multiple_pairs_per_image(reconstruction, max_pairs_per_image=7, min_points=100, parallax_sample_size=100, min_feature_coverage=0.6):
-    """
-    Find multiple pairs for each image instead of just one best pair.
-    Returns a dictionary where each key is an image_id and value is a list of partner image_ids.
-    """
-    
-    class MatchCandidate:
-        def __init__(self, image_id, shared_points):
-            self.image_id = image_id
-            self.shared_points = shared_points
-            self.avg_parallax_angle = 0
-            self.x_coverage = 0
-            self.y_coverage = 0
 
-    # initialize empty pair map (image ids to list of partner ids)
-    pairs = {}
-    for image in reconstruction.images.values():
-        pairs[image.image_id] = []
-    
-    # generate dict of image_id to set of point3D_ids
-    image_point3D_ids = {}
-    image_point3D_xy = {}
-    for image in reconstruction.images.values():
-        image_point3D_xy[image.image_id] = {}
-        for point2D in image.points2D:
-            if point2D.has_point3D():
-                image_point3D_xy[image.image_id][point2D.point3D_id] = point2D.xy
-                if image_point3D_ids.get(image.image_id, None) is None:
-                    image_point3D_ids[image.image_id] = set()
-                image_point3D_ids[image.image_id].add(point2D.point3D_id)
-
-    # iterate over all images
-    for i, image in enumerate(reconstruction.images.values()):
-        print(f"Getting multiple corresponding images for {image.name}... {i}/{len(reconstruction.images) - 1}")
-        # identify other images that share at least min_points points
-        other_images = [other_image for other_image in reconstruction.images.values() if other_image.image_id != image.image_id]
-        match_candidates = []
-        for other_image in other_images:
-            # get the points that the two images share
-            shared_points = image_point3D_ids[image.image_id] & image_point3D_ids[other_image.image_id]
-            if len(shared_points) >= min_points:
-                match_candidates.append(MatchCandidate(other_image.image_id, shared_points))
-        
-        # if there are no frames with a good number of shared points, skip this one
-        if len(match_candidates) == 0:
-            continue
-        
-        # for each match candidate, compute the feature coverage of the shared points
-        for match_candidate in match_candidates:
-            shared_points = match_candidate.shared_points
-            xs = [image_point3D_xy[image.image_id][point_id][0] for point_id in shared_points]
-            ys = [image_point3D_xy[image.image_id][point_id][1] for point_id in shared_points]
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
-            x_range = x_max - x_min
-            y_range = y_max - y_min
-            match_candidate.x_coverage = x_range / image.camera.width
-            match_candidate.y_coverage = y_range / image.camera.height
-
-        # for each match candidate, record the average parallax angle between the two images and each shared point
-        for match_candidate in match_candidates:
-            other_image = reconstruction.images[match_candidate.image_id]
-            shared_points = match_candidate.shared_points
-            parallax_angles = []
-            sample_size = min(parallax_sample_size, len(shared_points))
-            for point_id in random.sample(list(shared_points), sample_size):
-                point = reconstruction.points3D[point_id]
-                img1_cam = reconstruction.images[image.image_id].cam_from_world()
-                img1_R = img1_cam.rotation.matrix()
-                img1_t = img1_cam.translation
-                img2_cam = reconstruction.images[other_image.image_id].cam_from_world()
-                img2_R = img2_cam.rotation.matrix()
-                img2_t = img2_cam.translation
-                img1_C = -img1_R.T @ img1_t
-                img2_C = -img2_R.T @ img2_t
-                u = img1_C - point.xyz
-                v = img2_C - point.xyz
-                parallax_angle = np.arccos(np.clip(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v)), -1.0, 1.0))
-                parallax_angles.append(parallax_angle)
-            
-            avg_parallax_angle = np.mean(parallax_angles)
-            match_candidate.avg_parallax_angle = avg_parallax_angle
-
-        # Sort candidates by a combination of shared points, feature coverage, and parallax
-        match_candidates.sort(key=lambda x: (
-            len(x.shared_points) * 
-            ((x.x_coverage + x.y_coverage) / 2) * 
-            min(x.avg_parallax_angle, 1.0)  # Cap parallax contribution
-        ), reverse=True)
-        
-        # Select top candidates with good parallax (> 0.1 radians ≈ 5.7 degrees)
-        good_candidates = []
-        for candidate in match_candidates:
-            if candidate.avg_parallax_angle > 0.1 and len(good_candidates) < max_pairs_per_image:
-                good_candidates.append(candidate.image_id)
-        
-        # If no good parallax candidates, just take the top ones by shared points
-        if len(good_candidates) == 0:
-            good_candidates = [candidate.image_id for candidate in match_candidates[:max_pairs_per_image]]
-        
-        pairs[image.image_id] = good_candidates
-
-    return pairs
-
-
-def get_best_pairs(reconstruction, min_points=100, parallax_sample_size=100, min_feature_coverage=0.6):
-    """Original single-pair selection function"""
-
-    class MatchCandidate:
-        def __init__(self, image_id, shared_points):
-            self.image_id = image_id
-            self.shared_points = shared_points
-            self.avg_parallax_angle = 0
-            self.x_coverage = 0
-            self.y_coverage = 0
-
-    # initialize empty pair map (image ids)
-    pairs = {}
-    for image in reconstruction.images.values():
-        pairs[image.image_id] = -1
-    
-    # generate dict of image_id to set of point3D_ids
-    image_point3D_ids = {}
-    image_point3D_xy = {}
-    for image in reconstruction.images.values():
-        image_point3D_xy[image.image_id] = {}
-        for point2D in image.points2D:
-            if point2D.has_point3D():
-                image_point3D_xy[image.image_id][point2D.point3D_id] = point2D.xy
-                if image_point3D_ids.get(image.image_id, None) is None:
-                    image_point3D_ids[image.image_id] = set()
-                image_point3D_ids[image.image_id].add(point2D.point3D_id)
-
-    # iterate over all images
-    for i, image in enumerate(reconstruction.images.values()):
-        print(f"Getting best corresponding image for {image.name}... {i}/{len(reconstruction.images) - 1}")
-        # identify other images that share at least 100 points
-        other_images = [other_image for other_image in reconstruction.images.values() if other_image.image_id != image.image_id]
-        match_candidates = []
-        for other_image in other_images:
-            # get the points that the two images share
-            shared_points = image_point3D_ids[image.image_id] & image_point3D_ids[other_image.image_id]
-            match_candidates.append(MatchCandidate(other_image.image_id, shared_points))
-        
-        # sort by number of shared points
-        match_candidates.sort(key=lambda x: len(x.shared_points), reverse=True)
-        
-        # if there are no frames with a good number of shared points, skip this one
-        if len(match_candidates) == 0 or len(match_candidates[0].shared_points) < min_points:
-            continue
-        
-        # filter out match candidates that don't have enough matches
-        match_candidates = [match_candidate for match_candidate in match_candidates if len(match_candidate.shared_points) >= min_points]
-
-        # for each match candidate, compute the feature coverage of the shared points
-        for match_candidate in match_candidates:
-            shared_points = match_candidate.shared_points
-            xs = [image_point3D_xy[image.image_id][point_id][0] for point_id in shared_points]
-            ys = [image_point3D_xy[image.image_id][point_id][1] for point_id in shared_points]
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
-            x_range = x_max - x_min
-            y_range = y_max - y_min
-            match_candidate.x_coverage = x_range / image.camera.width
-            match_candidate.y_coverage = y_range / image.camera.height
-
-        # order match candidates by average xy coverage
-        match_candidates.sort(key=lambda x: (x.x_coverage + x.y_coverage) / 2, reverse=True)
-        
-        # # filter out match candidates that don't have enough feature coverage in the base image
-        # match_candidates = [match_candidate for match_candidate in match_candidates if match_candidate.x_coverage > min_feature_coverage and match_candidate.y_coverage > min_feature_coverage]
-
-        # for each match candidate, record the average parallax angle between the two images and each shared point
-        for match_candidate in match_candidates:
-            other_image = reconstruction.images[match_candidate.image_id]
-            shared_points = match_candidate.shared_points
-            parallax_angles = []
-            for point_id in random.sample(list(shared_points), parallax_sample_size):
-                point = reconstruction.points3D[point_id]
-                img1_cam = reconstruction.images[image.image_id].cam_from_world()
-                img1_R = img1_cam.rotation.matrix()
-                img1_t = img1_cam.translation
-                img2_cam = reconstruction.images[other_image.image_id].cam_from_world()
-                img2_R = img2_cam.rotation.matrix()
-                img2_t = img2_cam.translation
-                img1_C = -img1_R.T @ img1_t
-                img2_C = -img2_R.T @ img2_t
-                u = img1_C - point.xyz
-                v = img2_C - point.xyz
-                parallax_angle = np.arccos(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v)))
-                parallax_angles.append(parallax_angle)
-            
-            avg_parallax_angle = np.mean(parallax_angles)
-            match_candidate.avg_parallax_angle = avg_parallax_angle
-
-        if len(match_candidates) == 0:
-            continue
-        
-        # make sure the high overlap match has good parallax
-        winning_index = -1
-        for i in range(len(match_candidates)):
-            if match_candidates[i].avg_parallax_angle > 0.1:
-                winning_index = i
-                break
-        if winning_index == -1:
-            winning_index = 0
-        
-        pairs[image.image_id] = match_candidates[winning_index].image_id
-
-    return pairs
 
 if __name__ == "__main__":
     main()

@@ -491,6 +491,9 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
             else:
                 partners = [img2_list]
             
+            if len(partners) > 1:
+                print(f"Processing image {img1} with {len(partners)} partners: {partners}")
+            
             for img2 in partners:
                 if not reconstruction.has_image(int(img2)):
                     continue
@@ -524,6 +527,7 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
             image_batch_sizes.append([tuple([cam_1.width, cam_1.height]), tuple([cam_2.width, cam_2.height])])
 
         # get predictions for each image pair
+        print(f"Processing {len(image_batch)} pairs in this batch...")
         output = inference(image_batch, model=model, device=device, batch_size=config.batch_size, verbose=config.verbose)
 
         # triangulate each image pair
@@ -620,8 +624,10 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
                     'points': triangulated_points,
                     'colors': img1_color
                 }
+                # print(f"Created new point cloud for image {img1} with {len(triangulated_points)} points")
             else:
                 # Concatenate with existing points for this frame
+                prev_count = len(frame_clouds[img1]['points'])
                 frame_clouds[img1]['points'] = np.concatenate([
                     frame_clouds[img1]['points'], 
                     triangulated_points
@@ -630,11 +636,16 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
                     frame_clouds[img1]['colors'], 
                     img1_color
                 ], axis=0)
+                new_count = len(frame_clouds[img1]['points'])
+                # print(f"Accumulated points for image {img1}: {prev_count} + {len(triangulated_points)} = {new_count} total")
 
-    num_batches = len(pairs) // config.batch_size
+    # Create batches more efficiently by handling all pairs, including remainder
+    pair_keys = list(pairs.keys())
     batches = []
-    for i in range(num_batches):
-        batch = {k: v for k, v in pairs.items() if k in list(pairs.keys())[i*config.batch_size:(i+1)*config.batch_size]}
+    
+    for i in range(0, len(pair_keys), config.batch_size):
+        batch_keys = pair_keys[i:i + config.batch_size]
+        batch = {k: pairs[k] for k in batch_keys}
         batches.append(batch)
 
     for batch in batches:

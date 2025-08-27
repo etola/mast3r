@@ -339,6 +339,10 @@ def main():
     parser.add_argument('--enable_bbox_filter', action='store_true', help='Enable bounding box filtering based on COLMAP 3D points')
     parser.add_argument('--min_point_visibility', type=int, required=False, help='Minimum visibility (number of images) for COLMAP points used in bounding box computation. Default = 3', default=3)
     parser.add_argument('--bbox_padding_factor', type=float, required=False, help='Additional padding for bounding box as fraction of size. Default = 0.1', default=0.1)
+    # Point cloud outlier removal parameters
+    parser.add_argument('--enable_outlier_removal', action='store_true', help='Enable statistical outlier removal from point cloud')
+    parser.add_argument('--outlier_nb_neighbors', type=int, required=False, help='Number of neighbors for outlier removal. Default = 20', default=20)
+    parser.add_argument('--outlier_std_ratio', type=float, required=False, help='Standard deviation ratio for outlier removal. Default = 2.0', default=2.0)
     # Matching parameters
     parser.add_argument('--block_size_power', type=int, required=False, help='Block size as power of 2 (e.g., 14 for 2^14). Default = 14', default=14)
     args = parser.parse_args()
@@ -433,19 +437,41 @@ def main():
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(all_points)
     pcd.colors = o3d.utility.Vector3dVector(all_colors)
+    
+    # Apply statistical outlier removal if enabled
+    if config.enable_outlier_removal:
+        print(f"Removing statistical outliers (neighbors={config.outlier_nb_neighbors}, std_ratio={config.outlier_std_ratio})...")
+        points_before = len(pcd.points)
+        pcd, outlier_indices = pcd.remove_statistical_outlier(
+            nb_neighbors=config.outlier_nb_neighbors, 
+            std_ratio=config.outlier_std_ratio
+        )
+        points_after = len(pcd.points)
+        outliers_removed = points_before - points_after
+        print(f"Removed {outliers_removed:,} outlier points ({outliers_removed/points_before*100:.1f}%)")
+        print(f"Final point cloud: {points_after:,} points")
 
     # Save point cloud
     o3d.io.write_point_cloud(config.output_path, pcd)
     
     # Save processing summary
     summary_path = os.path.join(config.scene_dir, config.output_dir, 'processing_summary.json')
+    final_points = len(pcd.points)
     summary = {
-        'total_points': len(all_points),
+        'total_points_before_filtering': len(all_points),
+        'final_points_after_filtering': final_points,
         'total_frames_processed': total_frames_processed,
         'processing_time_seconds': end_time - start_time,
         'bounding_box_filtering_enabled': config.enable_bbox_filter,
-        'consistency_checking_enabled': config.enable_consistency_check
+        'consistency_checking_enabled': config.enable_consistency_check,
+        'outlier_removal_enabled': config.enable_outlier_removal
     }
+    if config.enable_outlier_removal:
+        summary.update({
+            'outlier_removal_neighbors': config.outlier_nb_neighbors,
+            'outlier_removal_std_ratio': config.outlier_std_ratio,
+            'outliers_removed': len(all_points) - final_points
+        })
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=4)
     
@@ -455,7 +481,10 @@ def main():
     print("DENSIFICATION COMPLETED")
     print("=" * 60)
     print(f"Dense point cloud: {config.output_path}")
-    print(f"Total points: {len(all_points):,}")
+    print(f"Final points: {final_points:,}")
+    if config.enable_outlier_removal:
+        print(f"Points before outlier removal: {len(all_points):,}")
+        print(f"Outliers removed: {len(all_points) - final_points:,}")
     print(f"Frames processed: {total_frames_processed}")
     print(f"Processing time: {end_time - start_time:.2f} seconds")
     print()
@@ -499,8 +528,8 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
             else:
                 partners = [img2_list]
             
-            if len(partners) > 1:
-                print(f"Processing image {img1} with {len(partners)} partners: {partners}")
+            # if len(partners) > 1:
+            #     print(f"Processing image {img1} with {len(partners)} partners: {partners}")
             
             for img2 in partners:
                 if not reconstruction.has_image(int(img2)):

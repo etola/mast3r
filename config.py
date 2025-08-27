@@ -48,6 +48,11 @@ class DensificationConfig:
     min_point_visibility: int = 3
     bbox_padding_factor: float = 0.1
     
+    # Point cloud outlier removal parameters
+    enable_outlier_removal: bool = False
+    outlier_nb_neighbors: int = 20
+    outlier_std_ratio: float = 2.0
+    
     # Matching parameters
     block_size_power: int = 14
     
@@ -136,6 +141,10 @@ class DensificationConfig:
         if self.enable_bbox_filter:
             print(f"    Min point visibility: {self.min_point_visibility}")
             print(f"    Padding factor: {self.bbox_padding_factor}")
+        print(f"  Outlier removal: {self.enable_outlier_removal}")
+        if self.enable_outlier_removal:
+            print(f"    Neighbors: {self.outlier_nb_neighbors}")
+            print(f"    Std ratio: {self.outlier_std_ratio}")
         print(f"  Block size for matching: 2^{self.block_size_power}")
         print("=" * 60)
     
@@ -163,5 +172,8 @@ def create_config_from_args(args) -> DensificationConfig:
         enable_bbox_filter=args.enable_bbox_filter,
         min_point_visibility=args.min_point_visibility,
         bbox_padding_factor=args.bbox_padding_factor,
+        enable_outlier_removal=args.enable_outlier_removal,
+        outlier_nb_neighbors=args.outlier_nb_neighbors,
+        outlier_std_ratio=args.outlier_std_ratio,
         block_size_power=args.block_size_power,
     ) 

@@ -54,6 +54,8 @@ class DensificationConfig:
     # Matching parameters
     block_size_power: int = 14
     
+
+    
     # Model parameters (fixed for MASt3R)
     model_w: int = 512
     model_h: int = 384

@@ -228,6 +228,181 @@ def fast_reciprocal_NNs(pts1, pts2, subsample_or_initxy1=8, ret_xy=True, pixel_t
     return xy1, xy2
 
 
+@torch.no_grad()
+def fast_reciprocal_NNs_rectified(pts1, pts2, subsample_or_initxy1=8, ret_xy=True, pixel_tol=0,
+                                  device='cuda', enable_profiling=True, max_disparity=None, **matcher_kw):
+    """
+    Fast reciprocal nearest neighbors for rectified stereo pairs.
+    Takes advantage of the fact that corresponding points lie on the same horizontal lines (epipolar constraint).
+    
+    Args:
+        pts1, pts2: Feature descriptors (H, W, DIM)
+        subsample_or_initxy1: Subsampling factor or initial coordinates
+        ret_xy: Whether to return xy coordinates
+        pixel_tol: Pixel tolerance for convergence
+        device: Computing device
+        enable_profiling: Whether to enable profiling
+        max_disparity: Maximum disparity to search (optional constraint)
+        **matcher_kw: Additional matcher arguments
+    
+    Returns:
+        xy1, xy2: Corresponding coordinates
+    """
+    with _profile_timer("Rectified Setup and Tensor Preparation", enable_profiling):
+        H1, W1, DIM1 = pts1.shape
+        H2, W2, DIM2 = pts2.shape
+        assert DIM1 == DIM2
+        assert H1 == H2, "Rectified images must have same height"
+        
+        pts1 = pts1.reshape(-1, DIM1)
+        pts2 = pts2.reshape(-1, DIM2)
+        
+        if isinstance(subsample_or_initxy1, int) and pixel_tol == 0:
+            S = subsample_or_initxy1
+            y1, x1 = np.mgrid[S // 2:H1:S, S // 2:W1:S].reshape(2, -1)
+            max_iter = 10
+        else:
+            x1, y1 = subsample_or_initxy1
+            if isinstance(x1, torch.Tensor):
+                x1 = x1.cpu().numpy()
+            if isinstance(y1, torch.Tensor):
+                y1 = y1.cpu().numpy()
+            max_iter = 1
+        
+        # Group points by y-coordinate for epipolar constraint
+        unique_y = np.unique(y1)
+        y_groups = {}
+        for y in unique_y:
+            mask = y1 == y
+            y_groups[y] = {
+                'x1': x1[mask],
+                'indices1': np.where(mask)[0],
+                'xy1_indices': x1[mask] + W1 * y  # Linear indices in image 1
+            }
+    
+    with _profile_timer("Rectified Tree Building and Device Setup", enable_profiling):
+        if 'dist' in matcher_kw or 'block_size' in matcher_kw \
+                or (isinstance(device, str) and device.startswith('cuda')) \
+                or (isinstance(device, torch.device) and device.type.startswith('cuda')):
+            pts1 = pts1.to(device)
+            pts2 = pts2.to(device)
+            use_cuda = True
+        else:
+            pts1, pts2 = to_numpy((pts1, pts2))
+            use_cuda = False
+    
+    with _profile_timer("Rectified Epipolar Constrained Matching", enable_profiling):
+        all_xy1 = []
+        all_xy2 = []
+        
+        for y in unique_y:
+            group = y_groups[y]
+            if len(group['x1']) == 0:
+                continue
+            
+            # Extract features for this horizontal line in both images
+            line1_indices = group['xy1_indices']
+            line2_indices = np.arange(y * W2, (y + 1) * W2)  # Full horizontal line in image 2
+            
+            # Apply disparity constraint if specified
+            if max_disparity is not None:
+                # For each x1, only consider x2 in range [x1-max_disparity, x1+max_disparity]
+                valid_line2_indices = []
+                x1_to_line2_range = {}
+                
+                for i, x1_val in enumerate(group['x1']):
+                    x2_start = max(0, x1_val - max_disparity)
+                    x2_end = min(W2, x1_val + max_disparity + 1)
+                    x2_range = np.arange(x2_start, x2_end)
+                    x1_to_line2_range[i] = len(valid_line2_indices) + np.arange(len(x2_range))
+                    valid_line2_indices.extend(y * W2 + x2_range)
+                
+                line2_indices = np.array(valid_line2_indices)
+            
+            if len(line2_indices) == 0:
+                continue
+            
+            # Extract feature vectors for this horizontal line
+            line1_features = pts1[line1_indices]
+            line2_features = pts2[line2_indices]
+            
+            if use_cuda:
+                # Use CUDA-based matching
+                if 'dist' not in matcher_kw:
+                    matcher_kw['dist'] = 'dot'
+                
+                # Compute similarity/distance matrix
+                if matcher_kw.get('dist') == 'dot':
+                    similarities = line1_features @ line2_features.T
+                    _, nn_1to2 = torch.max(similarities, dim=1)
+                    _, nn_2to1 = torch.max(similarities, dim=0)
+                else:  # L2 distance
+                    distances = torch.cdist(line1_features, line2_features)
+                    _, nn_1to2 = torch.min(distances, dim=1)
+                    _, nn_2to1 = torch.min(distances, dim=0)
+                
+                nn_1to2 = nn_1to2.cpu().numpy()
+                nn_2to1 = nn_2to1.cpu().numpy()
+            else:
+                # Use CPU-based matching with KDTree
+                from scipy.spatial import KDTree
+                tree2 = KDTree(line2_features)
+                tree1 = KDTree(line1_features)
+                
+                # Find nearest neighbors
+                _, nn_1to2 = tree2.query(line1_features)
+                _, nn_2to1 = tree1.query(line2_features)
+            
+            # Check reciprocal consistency
+            reciprocal_mask = []
+            for i in range(len(line1_indices)):
+                j = nn_1to2[i]
+                if j < len(nn_2to1) and nn_2to1[j] == i:
+                    reciprocal_mask.append(True)
+                else:
+                    reciprocal_mask.append(False)
+            
+            reciprocal_mask = np.array(reciprocal_mask)
+            
+            if reciprocal_mask.any():
+                # Convert back to image coordinates
+                valid_i = np.where(reciprocal_mask)[0]
+                for i in valid_i:
+                    x1_coord = group['x1'][i]
+                    y_coord = y
+                    
+                    j = nn_1to2[i]
+                    if max_disparity is not None:
+                        # Map back from constrained indices to full image coordinates
+                        x2_start = max(0, x1_coord - max_disparity)
+                        x2_coord = x2_start + (j % (2 * max_disparity + 1))
+                        x2_coord = min(x2_coord, W2 - 1)
+                    else:
+                        x2_coord = j  # j is already the x-coordinate in the line
+                    
+                    all_xy1.append([x1_coord, y_coord])
+                    all_xy2.append([x2_coord, y_coord])
+    
+    with _profile_timer("Rectified Post-processing", enable_profiling):
+        if len(all_xy1) == 0:
+            # No matches found
+            if ret_xy:
+                return np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
+            else:
+                return np.array([]), np.array([])
+        
+        xy1 = np.array(all_xy1)
+        xy2 = np.array(all_xy2)
+        
+        if not ret_xy:
+            # Convert to linear indices
+            idx1 = xy1[:, 0] + W1 * xy1[:, 1]
+            idx2 = xy2[:, 0] + W2 * xy2[:, 1]
+            return idx1.astype(np.int32), idx2.astype(np.int32)
+    
+    return xy1, xy2
+
+
 def extract_correspondences_nonsym(A, B, confA, confB, subsample=8, device=None, ptmap_key='pred_desc', pixel_tol=0):
     if '3d' in ptmap_key:
         opt = dict(device='cpu', workers=32)

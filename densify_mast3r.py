@@ -9,7 +9,6 @@ import json
 import random
 import torch
 from PIL import Image
-import cv2
 import time
 import argparse
 from contextlib import contextmanager
@@ -262,7 +261,9 @@ def main():
             pairs = json.load(open(config.pairs_path))
             print(f"Loaded pairs from {config.pairs_path}...")
 
-    with profile_timer("Main Densification (Batch Processing)", config.enable_profiling):
+    # Multi-view triangulation processing mode
+    print("Using multi-view triangulation processing mode...")
+    with profile_timer("Main Densification (Multi-view)", config.enable_profiling):
         frame_info = densify_pairs_mast3r_batch(reconstruction, pairs, config)
 
     end_time = time.time()
@@ -282,27 +283,27 @@ def main():
     print("Loading and merging saved point clouds...")
     all_points = None
     all_colors = None
-    total_frames_processed = 0
+    total_items_processed = 0
     saved_point_clouds = []
     
     with profile_timer("Point Cloud Loading and Merging", config.enable_profiling):
-        for frame_id, frame_data in frame_info.items():
-            if frame_data['saved_path'] and os.path.exists(frame_data['saved_path']):
-                total_frames_processed += 1
+        for item_id, item_data in frame_info.items():
+            if item_data.get('saved_path') and os.path.exists(item_data['saved_path']):
+                total_items_processed += 1
                 
                 # Load the saved point cloud
-                pcd = o3d.io.read_point_cloud(frame_data['saved_path'])
-                frame_points = np.asarray(pcd.points)
-                frame_colors = np.asarray(pcd.colors)
+                pcd = o3d.io.read_point_cloud(item_data['saved_path'])
+                item_points = np.asarray(pcd.points)
+                item_colors = np.asarray(pcd.colors)
                 
-                saved_point_clouds.append(frame_data['saved_path'])  # Track for cleanup
+                saved_point_clouds.append(item_data['saved_path'])  # Track for cleanup
                 
                 if all_points is None:
-                    all_points = frame_points
-                    all_colors = frame_colors
+                    all_points = item_points
+                    all_colors = item_colors
                 else:
-                    all_points = np.concatenate([all_points, frame_points], axis=0)
-                    all_colors = np.concatenate([all_colors, frame_colors], axis=0)
+                    all_points = np.concatenate([all_points, item_points], axis=0)
+                    all_colors = np.concatenate([all_colors, item_colors], axis=0)
 
     # Apply global bounding box filtering if enabled
     if not config.disable_bbox_filter and bbox_min is not None and bbox_max is not None:
@@ -338,7 +339,7 @@ def main():
     with profile_timer("Point Cloud Saving", config.enable_profiling):
         o3d.io.write_point_cloud(config.output_path, pcd)
     
-    
+   
     # Save processing summary
     summary_path = os.path.join(config.scene_dir, config.output_dir, 'processing_summary.json')
     final_points = len(pcd.points)
@@ -346,7 +347,8 @@ def main():
     summary = {
         'total_points_before_filtering': total_points_before_filtering,
         'final_points_after_filtering': final_points,
-        'total_frames_processed': total_frames_processed,
+        'total_items_processed': total_items_processed,
+        'processing_mode': 'multi_view',
         'processing_time_seconds': end_time - start_time,
         'bounding_box_filtering_enabled': not config.disable_bbox_filter,
         'outlier_removal_enabled': config.enable_outlier_removal
@@ -370,7 +372,8 @@ def main():
     if config.enable_outlier_removal:
         print(f"Points before outlier removal: {total_points_before_filtering:,}")
         print(f"Outliers removed: {total_points_before_filtering - final_points:,}")
-    print(f"Frames processed: {total_frames_processed}")
+    processing_mode_name = "frames (multi-view)"
+    print(f"{processing_mode_name.capitalize()} processed: {total_items_processed}")
     print(f"Processing time: {end_time - start_time:.2f} seconds")
     print()
     print("Output files saved to:")
@@ -677,6 +680,14 @@ def densify_for_image(reconstruction: ColmapReconstruction, key_frame_id: int, p
                 'points': triangulated_points,
                 'colors': pixel_colors
             }
+
+
+
+
+
+
+
+
 
 
 def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict, config: DensificationConfig) -> dict[int, np.ndarray]:

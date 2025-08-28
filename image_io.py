@@ -19,6 +19,7 @@ import time
 import threading
 from collections import OrderedDict
 from typing import List, Dict, Union, Any, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from PIL import Image as PIL_Image
 from PIL.ImageOps import exif_transpose
@@ -332,12 +333,13 @@ def _process_single_image(img_path: str, size: int, square_ok: bool = False,
 
 
 def load_images(folder_or_list: Union[str, List[str]], size: int, square_ok: bool = False, 
-               verbose: bool = True, patch_size: int = 16) -> List[Dict[str, Any]]:
+               verbose: bool = True, patch_size: int = 16, max_workers: Optional[int] = None) -> List[Dict[str, Any]]:
     """
-    Load and process images with caching support.
+    Load and process images with caching support and parallel processing.
     
     This function maintains the same interface as dust3r.utils.image.load_images
-    but adds intelligent caching to avoid redundant loading and processing.
+    but adds intelligent caching and parallel processing to avoid redundant 
+    loading and speed up processing.
     
     Args:
         folder_or_list: Path to folder or list of image paths
@@ -345,6 +347,7 @@ def load_images(folder_or_list: Union[str, List[str]], size: int, square_ok: boo
         square_ok: Whether square images are acceptable
         verbose: Whether to print loading information
         patch_size: Patch size for alignment (default: 16)
+        max_workers: Maximum number of worker threads (default: min(32, cpu_count + 4))
         
     Returns:
         List of dictionaries containing processed image data
@@ -376,19 +379,49 @@ def load_images(folder_or_list: Union[str, List[str]], size: int, square_ok: boo
     if not valid_paths:
         raise RuntimeError(f'No supported images found in {folder_or_list}')
     
-    # Process all images
-    imgs = []
-    for i, img_path in enumerate(valid_paths):
+    # Process all images in parallel
+    def process_image_with_index(args):
+        """Helper function to process image with its index."""
+        i, img_path = args
         try:
-            img_data = _process_single_image(img_path, size, square_ok, patch_size, verbose)
+            img_data = _process_single_image(img_path, size, square_ok, patch_size, verbose=False)
             # Set correct index and instance
             img_data['idx'] = i
             img_data['instance'] = str(i)
-            imgs.append(img_data)
+            return i, img_data, None  # (index, data, error)
         except Exception as e:
-            if verbose:
-                print(f'Warning: Failed to process {img_path}: {e}')
-            continue
+            return i, None, str(e)  # (index, data, error)
+    
+    # Use ThreadPoolExecutor for parallel processing
+    imgs = [None] * len(valid_paths)  # Pre-allocate to maintain order
+    failed_count = 0
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_index = {
+            executor.submit(process_image_with_index, (i, img_path)): i 
+            for i, img_path in enumerate(valid_paths)
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_index):
+            try:
+                i, img_data, error = future.result()
+                if error is None:
+                    imgs[i] = img_data
+                    if verbose:
+                        print(f' - processed {valid_paths[i]} [{i+1}/{len(valid_paths)}]')
+                else:
+                    failed_count += 1
+                    if verbose:
+                        print(f'Warning: Failed to process {valid_paths[i]}: {error}')
+            except Exception as e:
+                failed_count += 1
+                if verbose:
+                    print(f'Warning: Unexpected error processing image: {e}')
+    
+    # Filter out None values (failed images) and maintain order
+    imgs = [img for img in imgs if img is not None]
     
     if not imgs:
         raise RuntimeError(f'No images could be processed from {folder_or_list}')
@@ -398,7 +431,7 @@ def load_images(folder_or_list: Union[str, List[str]], size: int, square_ok: boo
         elapsed_time = time.time() - start_time
         cache_stats = get_cache().get_stats()
         print(f' (Processed {len(imgs)} images in {elapsed_time:.2f}s, '
-              f'cache hit rate: {cache_stats["hit_rate"]:.1%})')
+              f'{failed_count} failed, cache hit rate: {cache_stats["hit_rate"]:.1%})')
     
     return imgs
 
@@ -418,4 +451,62 @@ Image Cache Statistics:
 
 def clear_cache() -> None:
     """Clear the image cache."""
-    get_cache().clear() 
+    get_cache().clear()
+
+
+def load_images_parallel(folder_or_list: Union[str, List[str]], size: int = 512, 
+                        square_ok: bool = False, verbose: bool = True, 
+                        patch_size: int = 16, max_workers: Optional[int] = None,
+                        benchmark: bool = False) -> List[Dict[str, Any]]:
+    """
+    Convenient wrapper for load_images with parallel processing and benchmarking.
+    
+    This function provides an easy way to load images with optimal parallel settings
+    and optionally compare performance against sequential processing.
+    
+    Args:
+        folder_or_list: Path to folder or list of image paths
+        size: Target size for resizing (224 or 512)
+        square_ok: Whether square images are acceptable
+        verbose: Whether to print loading information
+        patch_size: Patch size for alignment (default: 16)
+        max_workers: Maximum number of worker threads (None for auto)
+        benchmark: If True, also run sequential version for comparison
+        
+    Returns:
+        List of dictionaries containing processed image data
+    """
+    import os
+    
+    # Auto-configure max_workers if not specified
+    if max_workers is None:
+        max_workers = min(32, (os.cpu_count() or 1) + 4)
+    
+    if verbose:
+        print(f"Using {max_workers} worker threads for parallel processing")
+    
+    # Load images with parallel processing
+    start_time = time.time()
+    imgs = load_images(folder_or_list, size, square_ok, verbose, patch_size, max_workers)
+    parallel_time = time.time() - start_time
+    
+    if benchmark and len(imgs) > 1:
+        # Clear cache and run sequential version for comparison
+        if verbose:
+            print("\n--- Benchmark: Running sequential version for comparison ---")
+        clear_cache()
+        
+        start_time = time.time()
+        imgs_seq = load_images(folder_or_list, size, square_ok, verbose, patch_size, max_workers=1)
+        sequential_time = time.time() - start_time
+        
+        speedup = sequential_time / parallel_time if parallel_time > 0 else 1.0
+        
+        if verbose:
+            print(f"\n--- Performance Comparison ---")
+            print(f"Sequential time: {sequential_time:.2f}s")
+            print(f"Parallel time:   {parallel_time:.2f}s") 
+            print(f"Speedup:         {speedup:.2f}x")
+            print(f"Workers used:    {max_workers}")
+    
+    return imgs 

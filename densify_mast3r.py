@@ -385,6 +385,54 @@ def main():
     o3d.visualization.draw_geometries([pcd])
 
 
+def triangulate_multiview_dlt(camera_matrices: np.ndarray, image_points: np.ndarray) -> np.ndarray:
+    """
+    Triangulate a 3D point from multiple views using Direct Linear Transformation (DLT).
+    
+    Args:
+        camera_matrices: Array of camera projection matrices (n_views, 3, 4)
+        image_points: Array of 2D image points (2, n_views)
+    
+    Returns:
+        3D point coordinates as numpy array (3,)
+    """
+    n_views = len(camera_matrices)
+    
+    # Build the linear system AX = 0
+    # Each view contributes 2 equations (u and v constraints)
+    A = np.zeros((2 * n_views, 4))
+    
+    for i in range(n_views):
+        P = camera_matrices[i]  # 3x4 projection matrix
+        u, v = image_points[:, i]  # 2D point coordinates
+        
+        # First equation: u * P[2,:] - P[0,:] = 0
+        # This comes from: u * (P[2,:] * X) = P[0,:] * X
+        A[2*i, :] = u * P[2, :] - P[0, :]
+        
+        # Second equation: v * P[2,:] - P[1,:] = 0
+        # This comes from: v * (P[2,:] * X) = P[1,:] * X
+        A[2*i + 1, :] = v * P[2, :] - P[1, :]
+    
+    # Solve AX = 0 using SVD
+    # The solution is the right singular vector corresponding to the smallest singular value
+    try:
+        _, _, Vt = np.linalg.svd(A)
+        X_homogeneous = Vt[-1, :]  # Last row of V^T (smallest singular value)
+        
+        # Convert from homogeneous to 3D coordinates
+        if abs(X_homogeneous[3]) < 1e-10:
+            # Point at infinity or numerical issues
+            return None
+        
+        X_3d = X_homogeneous[:3] / X_homogeneous[3]
+        return X_3d
+        
+    except np.linalg.LinAlgError:
+        # SVD failed
+        return None
+
+
 def densify_for_image(reconstruction: ColmapReconstruction, key_frame_id: int, partner_frame_ids: list, config: DensificationConfig, model, device, save_to_disk: bool = False, output_dir: str = None) -> dict:
     """
     Densify a single key frame using multi-view triangulation from collated tracks.
@@ -553,43 +601,22 @@ def densify_for_image(reconstruction: ColmapReconstruction, key_frame_id: int, p
             image_points = np.array(image_points).T  # Shape: (2, n_views)
             
             if len(camera_matrices) >= 2:  # Need at least 2 views for triangulation
-                # Use OpenCV's triangulation for multi-view case
-                if len(camera_matrices) == 2:
-                    # Standard two-view triangulation
-                    triangulated = cv2.triangulatePoints(
-                        camera_matrices[0], camera_matrices[1],
-                        image_points[:, [0]], image_points[:, [1]]
-                    )
-                else:
-                    # For more than 2 views, triangulate using first two and validate with others
-                    triangulated = cv2.triangulatePoints(
-                        camera_matrices[0], camera_matrices[1],
-                        image_points[:, [0]], image_points[:, [1]]
-                    )
+                # Multi-view triangulation using Direct Linear Transformation (DLT)
+                point_3d = triangulate_multiview_dlt(camera_matrices, image_points)
                 
-                # Convert from homogeneous coordinates
-                triangulated = triangulated / triangulated[3, :]
-                point_3d = triangulated[:3, 0]
+                # Check if triangulation was successful
+                if point_3d is None:
+                    continue
                 
-                # Basic validation: check if point is in front of cameras
-                valid_point = True
-                for cam_idx in range(len(camera_matrices)):
-                    cam_id = key_frame_id if cam_idx == 0 else observations[cam_idx-1][0]
-                    img_cam = reconstruction.get_image_cam_from_world(cam_id)
-                    points_cam = (img_cam.rotation.matrix() @ point_3d + img_cam.translation)
-                    if points_cam[2] <= 0:  # Behind camera
-                        valid_point = False
-                        break
+                # Trust the multi-view DLT result - it already optimally uses all observations
+                # Sample color from cached image using model coordinates
+                # The cached img_unnormalized is in model dimensions, so use model coords
+                x_clipped = int(np.clip(x_key_model, 0, img_width - 1))
+                y_clipped = int(np.clip(y_key_model, 0, img_height - 1))
+                color = key_img_array[y_clipped, x_clipped]
                 
-                if valid_point:
-                    # Sample color from cached image using model coordinates
-                    # The cached img_unnormalized is in model dimensions, so use model coords
-                    x_clipped = int(np.clip(x_key_model, 0, img_width - 1))
-                    y_clipped = int(np.clip(y_key_model, 0, img_height - 1))
-                    color = key_img_array[y_clipped, x_clipped]
-                    
-                    triangulated_points.append(point_3d)
-                    pixel_colors.append(color)
+                triangulated_points.append(point_3d)
+                pixel_colors.append(color)
     
     # Convert to numpy arrays
     if len(triangulated_points) > 0:

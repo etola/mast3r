@@ -177,248 +177,7 @@ def compute_depth_from_pair(reconstruction: ColmapReconstruction, img1_id: int, 
     return depths, triangulated_points
 
 
-def check_depth_consistency(pixel_depths, threshold=0.05, min_validations=2):
-    """
-    Find the depth value with maximum number of validations (robust to outliers).
-    For each depth, count how many other depths are within threshold% of it.
-    Returns the average of all depths consistent with the most validated depth.
-    
-    pixel_depths: list of depth values for the same pixel from different pairings
-    threshold: maximum allowed relative depth variation (e.g., 0.05 for 5%)
-    min_validations: minimum number of validations required
-    Returns: (avg_consistent_depth, is_consistent, num_validations)
-    """
-    if len(pixel_depths) < 2:
-        if len(pixel_depths) == 1:
-            return pixel_depths[0], True, 1
-        else:
-            return None, False, 0
-    
-    pixel_depths = np.array(pixel_depths)
-    # Remove invalid depths (negative or very small)
-    valid_depths = pixel_depths[pixel_depths > 0.1]
-    
-    if len(valid_depths) < 2:
-        if len(valid_depths) == 1:
-            return valid_depths[0], True, 1
-        else:
-            return None, False, 0
-    
-    # For each depth, count how many other depths are within threshold% of it
-    best_candidate_depth = None
-    max_validations = 0
-    
-    for i, candidate_depth in enumerate(valid_depths):
-        # Count validations for this candidate depth
-        validations = 0
-        for j, other_depth in enumerate(valid_depths):
-            if i != j:  # Don't count the depth against itself
-                relative_error = abs(other_depth - candidate_depth) / candidate_depth
-                if relative_error <= threshold:
-                    validations += 1
-        
-        # Add 1 to count the candidate depth itself
-        validations += 1
-        
-        if validations > max_validations:
-            max_validations = validations
-            best_candidate_depth = candidate_depth
-    
-    # Now collect all depths that are consistent with the best candidate depth
-    # and return their average for smoother results
-    if best_candidate_depth is not None:
-        consistent_depths = []
-        for depth in valid_depths:
-            relative_error = abs(depth - best_candidate_depth) / best_candidate_depth
-            if relative_error <= threshold:
-                consistent_depths.append(depth)
-        
-        # Return average of all consistent depths
-        avg_consistent_depth = np.mean(consistent_depths)
-        is_consistent = max_validations >= min_validations
-        return avg_consistent_depth, is_consistent, max_validations
-    else:
-        return None, False, 0
 
-
-def densify_with_consistency_check(reconstruction: ColmapReconstruction, pairs: dict, config: DensificationConfig):
-    """
-    Main function that implements multi-pairing consistency checking for each frame.
-    """
-    device = config.get_device()
-    
-    # load the model
-    with profile_timer("Model Loading (Consistency Check)", config.enable_profiling):
-        model = AsymmetricMASt3R.from_pretrained(config.model_path, verbose=config.verbose).to(device)
-
-    # Dictionary to store final consistent point clouds per frame
-    frame_clouds = {}
-    
-    # Process each frame
-    for frame_id, partner_ids in pairs.items():
-        if not partner_ids:  # Skip frames with no partners
-            continue
-            
-        print(f"Processing frame {frame_id} with {len(partner_ids)} partners...")
-        
-        # Store depth maps from different pairings for this frame
-        pixel_depth_maps = {}  # pixel_coord -> [depth1, depth2, ...]
-        pixel_points_maps = {}  # pixel_coord -> [point1, point2, ...]
-        pixel_colors = {}      # pixel_coord -> color
-        
-        # Process each pairing for this frame
-        for partner_id in partner_ids:
-            if not reconstruction.has_image(frame_id) or not reconstruction.has_image(partner_id):
-                continue
-                
-            # Load images for this pair
-            img1_name = reconstruction.get_image_name(frame_id)
-            img2_name = reconstruction.get_image_name(partner_id)
-            img1_path = os.path.join(config.img_dir, img1_name)
-            img2_path = os.path.join(config.img_dir, img2_name)
-            
-            try:
-                with profile_timer("Image Loading (Consistency)", config.enable_profiling):
-                    images = load_images([img1_path, img2_path], size=config.size)
-                    image_pair = tuple([images[0], images[1]])
-                
-                # Get predictions
-                with profile_timer("Model Inference (Consistency)", config.enable_profiling):
-                    output = inference([image_pair], model=model, device=device, batch_size=1, verbose=config.verbose)
-                
-                view1, pred1 = output['view1'], output['pred1']
-                view2, pred2 = output['view2'], output['pred2']
-                
-                desc1, desc2 = pred1['desc'][0].squeeze(0).detach(), pred2['desc'][0].squeeze(0).detach()
-                
-                # Compute feature matches
-                with profile_timer("Feature Matching (Consistency)", config.enable_profiling):
-                    matches_img1, matches_img2 = fast_reciprocal_NNs(
-                        desc1, desc2, 
-                        subsample_or_initxy1=config.sampling_factor, 
-                        device=device, 
-                        dist='dot', 
-                        block_size=config.get_block_size(),
-                        enable_profiling=config.enable_profiling
-                    )
-                
-                # Filter valid matches
-                H1, W1 = view1['true_shape'][0]
-                valid_matches_img1 = (matches_img1[:, 0] >= 3) & (matches_img1[:, 1] >= 3) & (matches_img1[:, 0] < int(W1) - 3) & (matches_img1[:, 1] < int(H1) - 3)
-                
-                H2, W2 = view2['true_shape'][0]
-                valid_matches_img2 = (matches_img2[:, 0] >= 3) & (matches_img2[:, 1] >= 3) & (matches_img2[:, 0] < int(W2) - 3) & (matches_img2[:, 1] < int(H2) - 3)
-                
-                valid_matches = valid_matches_img1 & valid_matches_img2
-                
-                matches_img1 = matches_img1[valid_matches]
-                matches_img2 = matches_img2[valid_matches]
-                
-                if matches_img1.shape[0] < 1:
-                    continue
-                
-                # Rescale matches to original image size
-                cam1 = reconstruction.get_image_camera(frame_id)
-                cam2 = reconstruction.get_image_camera(partner_id)
-                w1_scale = cam1.width / config.model_w
-                h1_scale = cam1.height / config.model_h
-                w2_scale = cam2.width / config.model_w
-                h2_scale = cam2.height / config.model_h
-                
-                matches_img1[:, 0] = matches_img1[:, 0] * w1_scale
-                matches_img1[:, 1] = matches_img1[:, 1] * h1_scale
-                matches_img2[:, 0] = matches_img2[:, 0] * w2_scale
-                matches_img2[:, 1] = matches_img2[:, 1] * h2_scale
-                
-                # Compute depths and 3D points
-                with profile_timer("Triangulation (Consistency)", config.enable_profiling):
-                    depths, points_3d = compute_depth_from_pair(reconstruction, frame_id, partner_id, matches_img1, matches_img2)
-                
-
-                
-                # Store depth information per pixel location
-                image = Image.open(img1_path)
-                img_width, img_height = image.size
-                
-                # Vectorized filtering and processing
-                depths = np.array(depths)
-                points_3d = np.array(points_3d)
-                
-                # Filter valid depths
-                valid_mask = depths > 0
-                valid_depths = depths[valid_mask]
-                valid_points = points_3d[valid_mask]
-                valid_matches = matches_img1[valid_mask]
-                
-                if len(valid_depths) == 0:
-                    continue
-                
-                # Round coordinates and check bounds vectorized
-                pixel_x = np.round(valid_matches[:, 0]).astype(int)
-                pixel_y = np.round(valid_matches[:, 1]).astype(int)
-                
-                # Bounds checking
-                bounds_mask = (
-                    (pixel_x >= 0) & (pixel_x < img_width) & 
-                    (pixel_y >= 0) & (pixel_y < img_height)
-                )
-                
-                # Apply bounds filter
-                valid_depths = valid_depths[bounds_mask]
-                valid_points = valid_points[bounds_mask]
-                pixel_x = pixel_x[bounds_mask]
-                pixel_y = pixel_y[bounds_mask]
-                
-                if len(valid_depths) == 0:
-                    continue
-                
-                # Vectorized color extraction for all valid pixels
-                img_array = np.array(image, dtype=np.float32) / 255.0
-                pixel_colors_array = img_array[pixel_y, pixel_x]
-                
-                # Build dictionaries for valid pixels only
-                for i in range(len(valid_depths)):
-                    pixel_coord = (pixel_x[i], pixel_y[i])
-                    
-                    if pixel_coord not in pixel_depth_maps:
-                        pixel_depth_maps[pixel_coord] = []
-                        pixel_points_maps[pixel_coord] = []
-                        pixel_colors[pixel_coord] = pixel_colors_array[i]
-                    
-                    pixel_depth_maps[pixel_coord].append(valid_depths[i])
-                    pixel_points_maps[pixel_coord].append(valid_points[i])
-                    
-            except Exception as e:
-                print(f"Error processing pair {frame_id}-{partner_id}: {e}")
-                continue
-        
-        # Now check consistency and build final point cloud for this frame
-        consistent_points = []
-        consistent_colors = []
-        
-        for pixel_coord, depths in pixel_depth_maps.items():
-            if len(depths) >= config.min_consistent_pairs:
-                avg_depth, is_consistent, num_validations = check_depth_consistency(
-                    depths, config.depth_consistency_threshold, config.min_consistent_pairs)
-                
-                if is_consistent and avg_depth is not None:
-                    # Find the point closest to the average validated depth
-                    best_idx = np.argmin(np.abs(np.array(depths) - avg_depth))
-                    best_point = pixel_points_maps[pixel_coord][best_idx]
-                    
-                    consistent_points.append(best_point)
-                    consistent_colors.append(pixel_colors[pixel_coord])
-        
-        if len(consistent_points) > 0:
-            frame_clouds[frame_id] = {
-                'points': np.array(consistent_points),
-                'colors': np.array(consistent_colors)
-            }
-            print(f"Frame {frame_id}: Generated {len(consistent_points)} consistent points from {len(pixel_depth_maps)} total pixel matches")
-        else:
-            print(f"Frame {frame_id}: No consistent points found")
-    
-    return frame_clouds
 
 
 def main():
@@ -434,11 +193,7 @@ def main():
 
     parser.add_argument('-f', '--sampling_factor', type=int, required=False, help='Sampling factor for point triangulation. Lower = denser. User powers of 2. Default = 8', default=8)
     parser.add_argument('-m', '--min_feature_coverage', type=float, required=False, help='Minimum proportion of image that must be covered by shared points to be considered a good match. Default = 0.6', default=0.6)
-    # New parameters for multi-pairing consistency
-    parser.add_argument('--max_pairs_per_image', type=int, required=False, help='Maximum number of pairs to compute per image for consistency checking. Default = 7', default=7)
-    parser.add_argument('--min_consistent_pairs', type=int, required=False, help='Minimum number of consistent pairings required to keep a point. Default = 3', default=3)
-    parser.add_argument('--depth_consistency_threshold', type=float, required=False, help='Depth consistency threshold as percentage (e.g., 0.05 for 5%%). Default = 0.05', default=0.05)
-    parser.add_argument('--enable_consistency_check', action='store_true', help='Enable multi-pairing consistency checking')
+    parser.add_argument('-p', '--pairs_per_image', type=int, required=False, help='Maximum number of pairs to compute per image. Default = 4', default=4)
     # Bounding box filtering parameters
     parser.add_argument('--disable_bbox_filter', action='store_true', help='Disable bounding box filtering')
     parser.add_argument('--min_point_visibility', type=int, required=False, help='Minimum visibility (number of images) for COLMAP points used in bounding box computation. Default = 3', default=3)
@@ -496,7 +251,7 @@ def main():
         with profile_timer("Pair Selection", config.enable_profiling):
             pairs = reconstruction.get_best_pairs(
                 min_feature_coverage=config.min_feature_coverage,
-                pairs_per_image=config.max_pairs_per_image
+                pairs_per_image=config.pairs_per_image
             )
         with profile_timer("Pairs Saving", config.enable_profiling):
             with open(config.pairs_path, 'w') as f:
@@ -507,16 +262,12 @@ def main():
             pairs = json.load(open(config.pairs_path))
             print(f"Loaded pairs from {config.pairs_path}...")
 
-    if config.enable_consistency_check:
-        with profile_timer("Main Densification (Consistency Check)", config.enable_profiling):
-            densified_frames = densify_with_consistency_check(reconstruction, pairs, config)
-    else:
-        with profile_timer("Main Densification (Batch Processing)", config.enable_profiling):
-            densified_pairs = densify_pairs_mast3r_batch(reconstruction, pairs, config)
-        # Convert to the expected format for backwards compatibility
-        densified_frames = {}
-        for img1, data in densified_pairs.items():
-            densified_frames[int(img1)] = data
+    with profile_timer("Main Densification (Batch Processing)", config.enable_profiling):
+        densified_pairs = densify_pairs_mast3r_batch(reconstruction, pairs, config)
+    # Convert to the expected format for backwards compatibility
+    densified_frames = {}
+    for img1, data in densified_pairs.items():
+        densified_frames[int(img1)] = data
 
     end_time = time.time()
     print(f"Processing completed in {end_time - start_time:.2f} seconds")
@@ -588,7 +339,6 @@ def main():
         'total_frames_processed': total_frames_processed,
         'processing_time_seconds': end_time - start_time,
         'bounding_box_filtering_enabled': not config.disable_bbox_filter,
-        'consistency_checking_enabled': config.enable_consistency_check,
         'outlier_removal_enabled': config.enable_outlier_removal
     }
     if config.enable_outlier_removal:

@@ -38,12 +38,8 @@ class DensificationConfig:
     cache_memory_gb: float = 16.0
     enable_profiling: bool = True
 
-    
-    # Multi-pairing consistency parameters
-    enable_consistency_check: bool = False
-    max_pairs_per_image: int = 7
-    min_consistent_pairs: int = 3
-    depth_consistency_threshold: float = 0.05
+    # Pair selection parameters
+    pairs_per_image: int = 4
     
     # Bounding box filtering parameters
     disable_bbox_filter: bool = False
@@ -129,17 +125,14 @@ class DensificationConfig:
         print(f"  Batch size: {self.batch_size}")
         print(f"  Sampling factor: {self.sampling_factor}")
         print(f"  Min feature coverage: {self.min_feature_coverage}")
+        print(f"  Pairs per image: {self.pairs_per_image}")
         print(f"  Device: {'CPU' if self.force_cpu else 'GPU (if available)'}")
         print(f"  Image cache memory: {self.cache_memory_gb:.1f}GB")
 
         print(f"  Verbose: {self.verbose}")
         print()
         print("Advanced Options:")
-        print(f"  Consistency checking: {self.enable_consistency_check}")
-        if self.enable_consistency_check:
-            print(f"    Max pairs per image: {self.max_pairs_per_image}")
-            print(f"    Min consistent pairs: {self.min_consistent_pairs}")
-            print(f"    Depth threshold: {self.depth_consistency_threshold}")
+
         print(f"  Bounding box filtering: {'Disabled' if self.disable_bbox_filter else 'Enabled (default)'}")
         if not self.disable_bbox_filter:
             print(f"    Min point visibility: {self.min_point_visibility}")
@@ -170,10 +163,7 @@ def create_config_from_args(args) -> DensificationConfig:
         cache_memory_gb=args.cache_memory_gb,
         enable_profiling=not args.disable_profiling,
 
-        enable_consistency_check=args.enable_consistency_check,
-        max_pairs_per_image=args.max_pairs_per_image,
-        min_consistent_pairs=args.min_consistent_pairs,
-        depth_consistency_threshold=args.depth_consistency_threshold,
+        pairs_per_image=args.pairs_per_image,
         disable_bbox_filter=args.disable_bbox_filter,
         min_point_visibility=args.min_point_visibility,
         bbox_padding_factor=args.bbox_padding_factor,

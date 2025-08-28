@@ -104,9 +104,17 @@ class ImageCache:
                 # Fallback estimation
                 memory += sys.getsizeof(tensor)
         
+        # Estimate unnormalized image memory
+        if 'img_unnormalized' in img_data:
+            unnorm_array = img_data['img_unnormalized']
+            if hasattr(unnorm_array, 'nbytes'):
+                memory += unnorm_array.nbytes
+            else:
+                memory += sys.getsizeof(unnorm_array)
+        
         # Add memory for other fields
         for key, value in img_data.items():
-            if key != 'img':
+            if key not in ['img', 'img_unnormalized']:
                 memory += sys.getsizeof(value)
         
         return memory
@@ -316,8 +324,10 @@ def _process_single_image(img_path: str, size: int, square_ok: bool = False,
     W2, H2 = img.size
     
     # Create result dictionary (same format as original load_images)
+    # Store both normalized (for network) and unnormalized (for color sampling) versions
     result = {
-        'img': ImgNorm(img)[None],
+        'img': ImgNorm(img)[None],  # Normalized for network processing
+        'img_unnormalized': np.array(img, dtype=np.float32) / 255.0,  # Unnormalized for color sampling
         'true_shape': np.int32([img.size[::-1]]),
         'idx': 0,  # Will be set by caller
         'instance': '0'  # Will be set by caller

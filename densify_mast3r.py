@@ -263,11 +263,7 @@ def main():
             print(f"Loaded pairs from {config.pairs_path}...")
 
     with profile_timer("Main Densification (Batch Processing)", config.enable_profiling):
-        densified_pairs = densify_pairs_mast3r_batch(reconstruction, pairs, config)
-    # Convert to the expected format for backwards compatibility
-    densified_frames = {}
-    for img1, data in densified_pairs.items():
-        densified_frames[int(img1)] = data
+        frame_info = densify_pairs_mast3r_batch(reconstruction, pairs, config)
 
     end_time = time.time()
     print(f"Processing completed in {end_time - start_time:.2f} seconds")
@@ -282,19 +278,31 @@ def main():
     profiling_path = os.path.join(config.scene_dir, config.output_dir, 'profiling_data.json')
     save_profiling_data(profiling_path, config.enable_profiling)
 
-    # Combine all points from different frames
+    # Load and combine all saved point clouds
+    print("Loading and merging saved point clouds...")
     all_points = None
     all_colors = None
     total_frames_processed = 0
+    saved_point_clouds = []
     
-    for frame_id, frame_data in densified_frames.items():
-        total_frames_processed += 1
-        if all_points is None:
-            all_points = frame_data['points']
-            all_colors = frame_data['colors']
-        else:
-            all_points = np.concatenate([all_points, frame_data['points']], axis=0)
-            all_colors = np.concatenate([all_colors, frame_data['colors']], axis=0)
+    with profile_timer("Point Cloud Loading and Merging", config.enable_profiling):
+        for frame_id, frame_data in frame_info.items():
+            if frame_data['saved_path'] and os.path.exists(frame_data['saved_path']):
+                total_frames_processed += 1
+                
+                # Load the saved point cloud
+                pcd = o3d.io.read_point_cloud(frame_data['saved_path'])
+                frame_points = np.asarray(pcd.points)
+                frame_colors = np.asarray(pcd.colors)
+                
+                saved_point_clouds.append(frame_data['saved_path'])  # Track for cleanup
+                
+                if all_points is None:
+                    all_points = frame_points
+                    all_colors = frame_colors
+                else:
+                    all_points = np.concatenate([all_points, frame_points], axis=0)
+                    all_colors = np.concatenate([all_colors, frame_colors], axis=0)
 
     # Apply global bounding box filtering if enabled
     if not config.disable_bbox_filter and bbox_min is not None and bbox_max is not None:
@@ -330,11 +338,13 @@ def main():
     with profile_timer("Point Cloud Saving", config.enable_profiling):
         o3d.io.write_point_cloud(config.output_path, pcd)
     
+    
     # Save processing summary
     summary_path = os.path.join(config.scene_dir, config.output_dir, 'processing_summary.json')
     final_points = len(pcd.points)
+    total_points_before_filtering = len(all_points) if all_points is not None else 0
     summary = {
-        'total_points_before_filtering': len(all_points),
+        'total_points_before_filtering': total_points_before_filtering,
         'final_points_after_filtering': final_points,
         'total_frames_processed': total_frames_processed,
         'processing_time_seconds': end_time - start_time,
@@ -345,7 +355,7 @@ def main():
         summary.update({
             'outlier_removal_neighbors': config.outlier_nb_neighbors,
             'outlier_removal_std_ratio': config.outlier_std_ratio,
-            'outliers_removed': len(all_points) - final_points
+            'outliers_removed': total_points_before_filtering - final_points
         })
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=4)
@@ -358,8 +368,8 @@ def main():
     print(f"Dense point cloud: {config.output_path}")
     print(f"Final points: {final_points:,}")
     if config.enable_outlier_removal:
-        print(f"Points before outlier removal: {len(all_points):,}")
-        print(f"Outliers removed: {len(all_points) - final_points:,}")
+        print(f"Points before outlier removal: {total_points_before_filtering:,}")
+        print(f"Outliers removed: {total_points_before_filtering - final_points:,}")
     print(f"Frames processed: {total_frames_processed}")
     print(f"Processing time: {end_time - start_time:.2f} seconds")
     print()
@@ -373,6 +383,273 @@ def main():
     # Display the point cloud
     print("Opening point cloud visualization...")
     o3d.visualization.draw_geometries([pcd])
+
+
+def densify_for_image(reconstruction: ColmapReconstruction, key_frame_id: int, partner_frame_ids: list, config: DensificationConfig, model, device, save_to_disk: bool = False, output_dir: str = None) -> dict:
+    """
+    Densify a single key frame using multi-view triangulation from collated tracks.
+    
+    Args:
+        reconstruction: COLMAP reconstruction
+        key_frame_id: ID of the key frame
+        partner_frame_ids: List of partner frame IDs
+        config: Densification configuration
+        model: MASt3R model
+        device: Computing device
+    
+    Returns:
+        Dictionary with 'points' and 'colors' for the key frame
+    """
+    from collections import defaultdict
+    
+    if not reconstruction.has_image(key_frame_id):
+        return {'points': np.array([]), 'colors': np.array([])}
+    
+    # Filter valid partner frames
+    valid_partners = [pid for pid in partner_frame_ids if reconstruction.has_image(pid)]
+    if not valid_partners:
+        return {'points': np.array([]), 'colors': np.array([])}
+    
+    print(f"Processing key frame {key_frame_id} with {len(valid_partners)} partners...")
+    
+    # Load key frame
+    key_img_name = reconstruction.get_image_name(key_frame_id)
+    key_img_path = os.path.join(config.img_dir, key_img_name)
+    
+    # Load all images for this key frame
+    image_paths = [key_img_path]
+    for partner_id in valid_partners:
+        partner_img_name = reconstruction.get_image_name(partner_id)
+        partner_img_path = os.path.join(config.img_dir, partner_img_name)
+        image_paths.append(partner_img_path)
+    
+    with profile_timer("Image Loading (Single Key Frame)", config.enable_profiling):
+        images = load_images(image_paths, size=config.size)
+    
+    # Prepare image pairs for inference - use the same approach as densify_batch
+    image_batch = []
+    image_batch_sizes = []
+    
+    key_cam = reconstruction.get_image_camera(key_frame_id)
+    key_size = (key_cam.width, key_cam.height)
+    
+    # Create image pairs using the loaded image dictionaries directly
+    key_image_dict = images[0]  # Use the full dictionary from load_images
+    
+    for i, partner_id in enumerate(valid_partners):
+        partner_cam = reconstruction.get_image_camera(partner_id)
+        partner_size = (partner_cam.width, partner_cam.height)
+        
+        partner_image_dict = images[i + 1]  # Use the full dictionary from load_images
+        
+        # Follow the same pattern as densify_batch
+        image_batch.append(tuple([key_image_dict, partner_image_dict]))
+        image_batch_sizes.append([key_size, partner_size])
+    
+    # Run inference
+    with profile_timer("Model Inference (Single Key Frame)", config.enable_profiling):
+        output = inference(image_batch, model=model, device=device, batch_size=config.batch_size, verbose=config.verbose)
+    
+    # Collect matches for each key frame pixel
+    pixel_tracks = defaultdict(list)  # pixel_coord -> [(partner_id, partner_coord), ...]
+    
+    for i, partner_id in enumerate(valid_partners):
+        view1, pred1 = output['view1'], output['pred1']
+        view2, pred2 = output['view2'], output['pred2']
+        
+        desc1 = pred1['desc'][i].squeeze(0).detach()
+        desc2 = pred2['desc'][i].squeeze(0).detach()
+        
+        # Compute feature matches
+        with profile_timer("Feature Matching (Single Key Frame)", config.enable_profiling):
+            matches_key, matches_partner = fast_reciprocal_NNs(
+                desc1, desc2,
+                subsample_or_initxy1=config.sampling_factor,
+                device=device,
+                dist='dot',
+                block_size=config.get_block_size(),
+                enable_profiling=config.enable_profiling
+            )
+        
+        # Validate matches within image boundaries
+        H1, W1 = view1['true_shape'][i]
+        valid_matches_key = (matches_key[:, 0] >= 3) & (matches_key[:, 1] >= 3) & \
+                           (matches_key[:, 0] < int(W1) - 3) & (matches_key[:, 1] < int(H1) - 3)
+        
+        H2, W2 = view2['true_shape'][i]
+        valid_matches_partner = (matches_partner[:, 0] >= 3) & (matches_partner[:, 1] >= 3) & \
+                               (matches_partner[:, 0] < int(W2) - 3) & (matches_partner[:, 1] < int(H2) - 3)
+        
+        valid_matches = valid_matches_key & valid_matches_partner
+        matches_key = matches_key[valid_matches]
+        matches_partner = matches_partner[valid_matches]
+        
+        if len(matches_key) == 0:
+            continue
+        
+        # Scale matches to original image size immediately (same as densify_batch)
+        key_w_scale = key_size[0] / config.model_w
+        key_h_scale = key_size[1] / config.model_h
+        partner_w_scale = image_batch_sizes[i][1][0] / config.model_w
+        partner_h_scale = image_batch_sizes[i][1][1] / config.model_h
+        
+        # Scale all matches to original coordinates (same as densify_batch)
+        matches_key_scaled = matches_key.astype(np.float64)  # Convert to float to allow scaling
+        matches_key_scaled[:, 0] *= key_w_scale
+        matches_key_scaled[:, 1] *= key_h_scale
+        
+        matches_partner_scaled = matches_partner.astype(np.float64)  # Convert to float to allow scaling
+        matches_partner_scaled[:, 0] *= partner_w_scale
+        matches_partner_scaled[:, 1] *= partner_h_scale
+        
+        # Group matches by scaled key frame pixel coordinates
+        for j in range(len(matches_key_scaled)):
+            # Use model coordinates (unscaled) as dictionary key for grouping
+            key_pixel = tuple(matches_key[j].astype(int))  
+            # Store scaled coordinates for triangulation
+            key_coord_scaled = matches_key_scaled[j]
+            partner_coord_scaled = matches_partner_scaled[j]
+            pixel_tracks[key_pixel].append((partner_id, key_coord_scaled, partner_coord_scaled))
+    
+    # Triangulate tracks with multiple observations
+    triangulated_points = []
+    pixel_colors = []
+    
+    # Use cached unnormalized image for color sampling (best of both worlds!)
+    # This avoids file I/O while preserving proper brightness
+    key_img_array = key_image_dict['img_unnormalized']  # Already normalized [0,1] without ImgNorm
+    img_height, img_width = key_img_array.shape[:2]  # Note: numpy shape is (H, W, C)
+    
+    with profile_timer("Multi-view Triangulation (Single Key Frame)", config.enable_profiling):
+        for pixel_coord, observations in pixel_tracks.items():
+            if len(observations) < 1:  # Need at least one partner observation
+                continue
+            
+            x_key_model, y_key_model = pixel_coord  # These are in model coordinates
+            
+            # We'll check bounds later using scaled coordinates since we're using original image
+            
+            # Prepare data for multi-view triangulation using already-scaled coordinates
+            camera_matrices = []
+            image_points = []
+            
+            # Get the first observation to extract key frame scaled coordinates
+            first_observation = observations[0]
+            _, key_coord_scaled, _ = first_observation
+            
+            # Add key frame observation (using scaled coordinates)
+            P_key = reconstruction.get_camera_projection_matrix(key_frame_id)
+            camera_matrices.append(P_key)
+            image_points.append([key_coord_scaled[0], key_coord_scaled[1]])
+            
+            # Add partner observations (using stored scaled coordinates)
+            for partner_id, key_coord_scaled, partner_coord_scaled in observations:
+                P_partner = reconstruction.get_camera_projection_matrix(partner_id)
+                camera_matrices.append(P_partner)
+                image_points.append([partner_coord_scaled[0], partner_coord_scaled[1]])
+            
+            # Convert to numpy arrays
+            camera_matrices = np.array(camera_matrices)
+            image_points = np.array(image_points).T  # Shape: (2, n_views)
+            
+            if len(camera_matrices) >= 2:  # Need at least 2 views for triangulation
+                # Use OpenCV's triangulation for multi-view case
+                if len(camera_matrices) == 2:
+                    # Standard two-view triangulation
+                    triangulated = cv2.triangulatePoints(
+                        camera_matrices[0], camera_matrices[1],
+                        image_points[:, [0]], image_points[:, [1]]
+                    )
+                else:
+                    # For more than 2 views, triangulate using first two and validate with others
+                    triangulated = cv2.triangulatePoints(
+                        camera_matrices[0], camera_matrices[1],
+                        image_points[:, [0]], image_points[:, [1]]
+                    )
+                
+                # Convert from homogeneous coordinates
+                triangulated = triangulated / triangulated[3, :]
+                point_3d = triangulated[:3, 0]
+                
+                # Basic validation: check if point is in front of cameras
+                valid_point = True
+                for cam_idx in range(len(camera_matrices)):
+                    cam_id = key_frame_id if cam_idx == 0 else observations[cam_idx-1][0]
+                    img_cam = reconstruction.get_image_cam_from_world(cam_id)
+                    points_cam = (img_cam.rotation.matrix() @ point_3d + img_cam.translation)
+                    if points_cam[2] <= 0:  # Behind camera
+                        valid_point = False
+                        break
+                
+                if valid_point:
+                    # Sample color from cached image using model coordinates
+                    # The cached img_unnormalized is in model dimensions, so use model coords
+                    x_clipped = int(np.clip(x_key_model, 0, img_width - 1))
+                    y_clipped = int(np.clip(y_key_model, 0, img_height - 1))
+                    color = key_img_array[y_clipped, x_clipped]
+                    
+                    triangulated_points.append(point_3d)
+                    pixel_colors.append(color)
+    
+    # Convert to numpy arrays
+    if len(triangulated_points) > 0:
+        triangulated_points = np.array(triangulated_points)
+        pixel_colors = np.array(pixel_colors)
+        
+        # Apply distance filtering
+        key_cam_center = reconstruction.get_camera_center(key_frame_id)
+        distances = np.linalg.norm(triangulated_points - key_cam_center, axis=1)
+        
+        # Compute typical baseline for filtering
+        if valid_partners:
+            typical_baseline = np.mean([
+                reconstruction.compute_baseline(key_frame_id, pid) 
+                for pid in valid_partners[:3]  # Use first few partners
+            ])
+            
+            # Filter points that are too far
+            valid_distance = distances < 20 * typical_baseline
+            triangulated_points = triangulated_points[valid_distance]
+            pixel_colors = pixel_colors[valid_distance]
+        
+        print(f"Generated {len(triangulated_points)} points for key frame {key_frame_id}")
+        
+        if save_to_disk and output_dir:
+            # Save point cloud to disk immediately
+            frame_filename = f"frame_{key_frame_id:06d}.ply"
+            frame_path = os.path.join(output_dir, frame_filename)
+            
+            with profile_timer("Frame Point Cloud Saving", config.enable_profiling):
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(triangulated_points)
+                pcd.colors = o3d.utility.Vector3dVector(pixel_colors)
+                o3d.io.write_point_cloud(frame_path, pcd)
+                print(f"Saved frame {key_frame_id} point cloud to {frame_filename}")
+            
+            return {
+                'saved_path': frame_path,
+                'point_count': len(triangulated_points)
+            }
+        else:
+            return {
+                'points': triangulated_points,
+                'colors': pixel_colors
+            }
+    else:
+        triangulated_points = np.array([]).reshape(0, 3)
+        pixel_colors = np.array([]).reshape(0, 3)
+        print(f"No valid points generated for key frame {key_frame_id}")
+        
+        if save_to_disk and output_dir:
+            return {
+                'saved_path': None,
+                'point_count': 0
+            }
+        else:
+            return {
+                'points': triangulated_points,
+                'colors': pixel_colors
+            }
 
 
 def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict, config: DensificationConfig) -> dict[int, np.ndarray]:
@@ -560,19 +837,32 @@ def densify_pairs_mast3r_batch(reconstruction: ColmapReconstruction, pairs: dict
                 new_count = len(frame_clouds[img1]['points'])
                 # print(f"Accumulated points for image {img1}: {prev_count} + {len(triangulated_points)} = {new_count} total")
 
-    # Create batches more efficiently by handling all pairs, including remainder
-    pair_keys = list(pairs.keys())
-    batches = []
+    # New densification strategy: use multi-view triangulation per key frame
+    # Create temporary directory for frame point clouds
+    frame_clouds_dir = os.path.join(config.scene_dir, config.output_dir, 'temp_frame_clouds')
+    os.makedirs(frame_clouds_dir, exist_ok=True)
     
-    for i in range(0, len(pair_keys), config.batch_size):
-        batch_keys = pair_keys[i:i + config.batch_size]
-        batch = {k: pairs[k] for k in batch_keys}
-        batches.append(batch)
-
-    for batch in batches:
-        densify_batch(batch)
+    print(f"Processing {len(pairs)} frames with multi-view triangulation strategy...")
+    frame_info = {}  # Store frame information instead of actual point clouds
     
-    return frame_clouds
+    for key_frame_id, partner_frame_ids in pairs.items():
+        # Convert to appropriate format
+        key_frame_id = int(key_frame_id)
+        if isinstance(partner_frame_ids, list):
+            partners = [int(pid) for pid in partner_frame_ids]
+        else:
+            partners = [int(partner_frame_ids)]
+        
+        # Use the new densification function with disk saving
+        frame_result = densify_for_image(
+            reconstruction, key_frame_id, partners, config, model, device,
+            save_to_disk=True, output_dir=frame_clouds_dir
+        )
+        
+        if frame_result['point_count'] > 0:
+            frame_info[key_frame_id] = frame_result
+    
+    return frame_info
 
 
 
